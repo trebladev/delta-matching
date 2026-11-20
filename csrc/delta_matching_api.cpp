@@ -272,14 +272,23 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8_varlen(
                 "delta_matching fwd_varlen: packed token count exceeds int32");
     TORCH_CHECK(fp11_hd_supported(d), "delta_matching fwd_varlen: head_dim must be 256 (or 128 in a Delta-Matching-128 build)");
     int const rq = fp11_quant_rows_q(d), rk = fp11_quant_keys(d);
-    TORCH_CHECK(max_seqlen_q % rq == 0 && max_seqlen_k % rk == 0,
-                "delta_matching fwd_varlen: max lengths must align to the FP8 scale blocks");
-    if (d == 128) {
-        TORCH_CHECK(max_seqlen_k % 256 == 0,
-                    "delta_matching fwd_varlen (Delta-Matching-128): max_seqlen_k must be a 256-multiple");
+    auto align_up = [](int64_t n, int a) -> int {
+        TORCH_CHECK(n <= INT_MAX, "delta_matching fwd_varlen: max length exceeds int32");
+        return int((n + a - 1) / a * a);
+    };
+    // The scheduler and TMA descriptors use regular tile extents.  FA3 accepts
+    // arbitrary max lengths, so launch the native kernel on the smallest
+    // aligned workspace and compact back to the caller's packed lengths.
+    int const launch_max_q = align_up(max_seqlen_q, rq);
+    int launch_max_k = align_up(max_seqlen_k, rk);
+    if (d == 128) launch_max_k = align_up(max_seqlen_k, 256);
+    for (int i = 0; i < b; ++i) {
+        TORCH_CHECK(cu_seqlens_q[i + 1].item<int>() - cu_seqlens_q[i].item<int>() <= max_seqlen_q &&
+                    cu_seqlens_k[i + 1].item<int>() - cu_seqlens_k[i].item<int>() <= max_seqlen_k,
+                    "delta_matching fwd_varlen: sequence length exceeds max_seqlen");
     }
-    TORCH_CHECK(q8s.size(2) >= max_seqlen_q / rq &&
-                k8s.size(2) >= max_seqlen_k / rk && v8s.size(2) >= max_seqlen_k / rk,
+    TORCH_CHECK(q8s.size(2) >= (launch_max_q + rq - 1) / rq &&
+                k8s.size(2) >= (launch_max_k + rk - 1) / rk && v8s.size(2) >= (launch_max_k + rk - 1) / rk,
                 "delta_matching fwd_varlen: scale tensors are too short for max lengths");
     auto opts = q8.options();
     // TMA descriptors reject zero global extents.  Match FA3's host-side
@@ -295,8 +304,9 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8_varlen(
         auto empty_lse = torch::full({q8.size(0), h}, -std::numeric_limits<float>::infinity(), opts.dtype(at::kFloat));
         return {empty_o, empty_lse};
     }
-    bool const needs_padding = (q8.size(0) != b * int(max_seqlen_q)) ||
-                               (k8.size(0) != b * int(max_seqlen_k)) ||
+    bool const needs_padding = (q8.size(0) != b * launch_max_q) ||
+                               (k8.size(0) != b * launch_max_k) ||
+                               launch_max_q != max_seqlen_q || launch_max_k != max_seqlen_k ||
                                seqused_q_opt.has_value() || seqused_k_opt.has_value();
     if (seqused_q_opt.has_value() || seqused_k_opt.has_value()) {
         TORCH_CHECK(seqused_q_opt.has_value() && seqused_k_opt.has_value(),
@@ -320,8 +330,8 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8_varlen(
     if (needs_padding) {
         std::vector<int> hq(b + 1), hkoff(b + 1), husedq(b), husedk(b);
         for (int i = 0; i <= b; ++i) {
-            hq[i] = i * int(max_seqlen_q);
-            hkoff[i] = i * int(max_seqlen_k);
+            hq[i] = i * launch_max_q;
+            hkoff[i] = i * launch_max_k;
         }
         for (int i = 0; i < b; ++i) {
             husedq[i] = seqused_q_opt.has_value() ? (*seqused_q_opt)[i].item<int>() : cu_seqlens_q[i + 1].item<int>() - cu_seqlens_q[i].item<int>();
@@ -332,8 +342,8 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8_varlen(
         cu_k_work = torch::tensor(hkoff, iopts);
         used_q = torch::tensor(husedq, iopts);
         used_k = torch::tensor(husedk, iopts);
-        work_q = b * int(max_seqlen_q);
-        work_k = b * int(max_seqlen_k);
+        work_q = b * launch_max_q;
+        work_k = b * launch_max_k;
         q_work = torch::zeros({work_q, h, d}, opts);
         k_work = torch::zeros({work_k, hk, d}, opts);
         v_work = torch::zeros({work_k, hk, d}, opts);
@@ -358,7 +368,7 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8_varlen(
     auto sem = torch::zeros({metadata_offset + 1}, opts.dtype(at::kInt));
     Flash_fwd_fp8_params p{};
     p.b = b; p.h = h; p.h_k = hk;
-    p.seqlen_q = int(max_seqlen_q); p.seqlen_k = int(max_seqlen_k);
+    p.seqlen_q = launch_max_q; p.seqlen_k = launch_max_k;
     p.seqlen_q_rounded = p.seqlen_q; p.seqlen_k_rounded = p.seqlen_k;
     p.total_q = work_q; p.total_k = work_k;
     p.d = d; p.dv = d; p.d_rounded = d; p.dv_rounded = d;
@@ -404,8 +414,8 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8_varlen(
     for (int i = 0; i < b; ++i) {
         int const qs = cu_seqlens_q[i].item<int>();
         int const qn = used_q[i].item<int>();
-        o_out.narrow(0, qs, qn).copy_(o.narrow(0, i * int(max_seqlen_q), qn));
-        lse_out.narrow(0, qs, qn).copy_(lse.narrow(0, i * int(max_seqlen_q), qn));
+        o_out.narrow(0, qs, qn).copy_(o.narrow(0, i * launch_max_q, qn));
+        lse_out.narrow(0, qs, qn).copy_(lse.narrow(0, i * launch_max_q, qn));
     }
     return {o_out, lse_out};
 }
@@ -690,14 +700,30 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_varlen(
         auto zv = torch::zeros({total_k, hk, d}, q8.options().dtype(at::kBFloat16));
         return {zq, zk, zv};
     }
-    TORCH_CHECK(max_seqlen_q % 64 == 0 && max_seqlen_k % kbn == 0);
-    int const nbm = max_seqlen_q / 64, nbn = max_seqlen_k / kbn;
+    auto align_up = [](int64_t n, int a) -> int {
+        TORCH_CHECK(n <= INT_MAX, "delta_matching bwd_varlen: max length exceeds int32");
+        return int((n + a - 1) / a * a);
+    };
+    int const launch_max_q = align_up(max_seqlen_q, 64);
+    int const launch_max_k = align_up(max_seqlen_k, kbn);
+    for (int i = 0; i < b; ++i) {
+        TORCH_CHECK(cu_seqlens_q[i + 1].item<int>() - cu_seqlens_q[i].item<int>() <= max_seqlen_q &&
+                    cu_seqlens_k[i + 1].item<int>() - cu_seqlens_k[i].item<int>() <= max_seqlen_k,
+                    "delta_matching bwd_varlen: sequence length exceeds max_seqlen");
+    }
+    TORCH_CHECK(q8s.size(2) >= (launch_max_q + rq - 1) / rq &&
+                do8s.size(2) >= (launch_max_q + rq - 1) / rq &&
+                k8s.size(2) >= (launch_max_k + rk - 1) / rk &&
+                v8s.size(2) >= (launch_max_k + rk - 1) / rk,
+                "delta_matching bwd_varlen: scale tensors are too short for max lengths");
+    int const nbm = launch_max_q / 64, nbn = launch_max_k / kbn;
     auto opts = q8.options();
     // TMA descriptors require a regular per-batch extent.  Repack unequal
     // packed sequences into a B*max-length workspace while retaining the
     // original lengths in seqused_{q,k}.  The kernel still runs once over all
     // sequences and pass 2 compacts its results below.
-    bool const needs_padding = (total_q != b * int(max_seqlen_q)) || (total_k != b * int(max_seqlen_k));
+    bool const needs_padding = (total_q != b * launch_max_q) || (total_k != b * launch_max_k) ||
+                               launch_max_q != max_seqlen_q || launch_max_k != max_seqlen_k;
     at::Tensor q_work = q8, k_work = k8, v_work = v8, do_work = dout8;
     at::Tensor qt_work = qt8, kt_work = kt8, dot_work = dot8;
     at::Tensor lse_work = lse.transpose(0, 1).contiguous();
@@ -706,7 +732,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_varlen(
     int work_q = total_q, work_k = total_k;
     if (needs_padding) {
         std::vector<int> hq(b + 1), hkoff(b + 1), husedq(b), husedk(b);
-        for (int i = 0; i <= b; ++i) { hq[i] = i * int(max_seqlen_q); hkoff[i] = i * int(max_seqlen_k); }
+        for (int i = 0; i <= b; ++i) { hq[i] = i * launch_max_q; hkoff[i] = i * launch_max_k; }
         for (int i = 0; i < b; ++i) {
             husedq[i] = cu_seqlens_q[i + 1].item<int>() - cu_seqlens_q[i].item<int>();
             husedk[i] = cu_seqlens_k[i + 1].item<int>() - cu_seqlens_k[i].item<int>();
@@ -714,7 +740,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_varlen(
         auto iopts = cu_seqlens_q.options();
         cu_work = torch::tensor(hq, iopts); cu_k_work = torch::tensor(hkoff, iopts);
         used_q = torch::tensor(husedq, iopts); used_k = torch::tensor(husedk, iopts);
-        work_q = b * int(max_seqlen_q); work_k = b * int(max_seqlen_k);
+        work_q = b * launch_max_q; work_k = b * launch_max_k;
         q_work = torch::zeros({work_q, h, d}, opts); k_work = torch::zeros({work_k, hk, d}, opts);
         v_work = torch::zeros({work_k, hk, d}, opts); do_work = torch::zeros({work_q, h, d}, opts);
         qt_work = torch::zeros({h, d, work_q}, opts); dot_work = torch::zeros({h, d, work_q}, opts);
@@ -743,7 +769,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_varlen(
     at::Tensor delta_c = delta_work;
     Flash_bwd_fp8_params p{};
     p.varlen = true; p.b = b; p.h = h; p.h_k = hk; p.total_q = work_q; p.total_k = work_k;
-    p.seqlen_q = max_seqlen_q; p.seqlen_k = max_seqlen_k; p.seqlen_q_rounded = max_seqlen_q; p.seqlen_k_rounded = max_seqlen_k;
+    p.seqlen_q = launch_max_q; p.seqlen_k = launch_max_k; p.seqlen_q_rounded = launch_max_q; p.seqlen_k_rounded = launch_max_k;
     p.d = d; p.dv = d; p.d_rounded = d; p.dv_rounded = d; p.scale_softmax = float(softmax_scale); p.is_causal = is_causal; p.is_bf16 = true;
     p.q_ptr=q_work.data_ptr(); p.k_ptr=k_work.data_ptr(); p.v_ptr=v_work.data_ptr(); p.do_ptr=do_work.data_ptr();
     p.q_row_stride=q_work.stride(0); p.q_head_stride=q_work.stride(1); p.q_batch_stride=0;
@@ -764,7 +790,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_varlen(
     auto dk_out = torch::empty({total_k, hk, d}, opts.dtype(at::kBFloat16));
     auto dv_out = torch::empty({total_k, hk, d}, opts.dtype(at::kBFloat16));
     auto dk_fold = fold_gqa(dk), dv_fold = fold_gqa(dv);
-    for (int i=0;i<b;++i) { int qs=cu_seqlens_q[i].item<int>(), ks=cu_seqlens_k[i].item<int>(); int qn=used_q[i].item<int>(), kn=used_k[i].item<int>(); dq_out.narrow(0,qs,qn).copy_(dq.narrow(0,i*int(max_seqlen_q),qn)); dk_out.narrow(0,ks,kn).copy_(dk_fold.narrow(0,i*int(max_seqlen_k),kn)); dv_out.narrow(0,ks,kn).copy_(dv_fold.narrow(0,i*int(max_seqlen_k),kn)); }
+    for (int i=0;i<b;++i) { int qs=cu_seqlens_q[i].item<int>(), ks=cu_seqlens_k[i].item<int>(); int qn=used_q[i].item<int>(), kn=used_k[i].item<int>(); dq_out.narrow(0,qs,qn).copy_(dq.narrow(0,i*launch_max_q,qn)); dk_out.narrow(0,ks,kn).copy_(dk_fold.narrow(0,i*launch_max_k,kn)); dv_out.narrow(0,ks,kn).copy_(dv_fold.narrow(0,i*launch_max_k,kn)); }
     return {dq_out, dk_out, dv_out};
 }
 

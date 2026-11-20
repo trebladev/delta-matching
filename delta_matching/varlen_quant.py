@@ -1,10 +1,10 @@
-"""Packed varlen FP8 producers for block-aligned sequences.
+"""Packed varlen FP8 producers for ragged sequences.
 
 This module is deliberately separate from the fixed-shape producers.  It provides the
 layout needed by the native varlen CUDA path: codes are concatenated in sequence order,
-while scale rows are padded to one common block count per batch.  The current kernels
-require non-empty sequence lengths to be multiples of their quantization block. Empty
-segments are retained in the metadata and produce no codes or twin columns.
+while scale rows are padded to one common block count per batch. Sequences are
+quantized over an aligned temporary tail while the public packed layout keeps
+the original token count. Empty segments are retained in the metadata.
 """
 from __future__ import annotations
 
@@ -63,8 +63,8 @@ def _pack_one(x: torch.Tensor, cu: torch.Tensor, h: int, D: int, kind: str,
         lo, hi = int(cu[b]), int(cu[b + 1])
         n = hi - lo
         logical_n = n if used_lengths is None else int(used_lengths[b])
-        if n < 0 or logical_n < 0 or logical_n > n or (n > 0 and n % blk) or (logical_n > 0 and logical_n % blk):
-            raise ValueError(f"delta_matching: {kind} sequence lengths must be nonnegative {blk}-multiples (got {n})")
+        if n < 0 or logical_n < 0 or logical_n > n:
+            raise ValueError(f"delta_matching: {kind} sequence lengths must be nonnegative (got {n})")
         if n == 0 or logical_n == 0:
             # FA3 permits empty segments.  There is no producer work or twin
             # tile for such a segment, but its padded scale row is retained.
@@ -74,7 +74,15 @@ def _pack_one(x: torch.Tensor, cu: torch.Tensor, h: int, D: int, kind: str,
             if want_twin:
                 twin.append(torch.zeros((h, D, n), device=x.device, dtype=torch.float8_e4m3fn))
             continue
-        xb = x[lo:lo + logical_n].permute(1, 0, 2).contiguous().unsqueeze(0)
+        # The native K twin uses 64-token pi tiles.  Quantization blocks are
+        # 32 tokens for d256 K/V, so round the temporary producer extent to
+        # the stronger 64-token requirement while retaining block scales.
+        quant_unit = max(blk, 64)
+        quant_n = ((logical_n + quant_unit - 1) // quant_unit) * quant_unit
+        xb = x[lo:lo + logical_n]
+        if quant_n > logical_n:
+            xb = torch.cat((xb, torch.zeros((quant_n - logical_n, h, D), device=x.device, dtype=x.dtype)), dim=0)
+        xb = xb.permute(1, 0, 2).contiguous().unsqueeze(0)
         if kind == "q":
             q8, s, _, = _quant_native(xb, xb, xb)[:3]
             # _quant_native quantizes all three operands.  Keep its Q result only.
@@ -85,15 +93,17 @@ def _pack_one(x: torch.Tensor, cu: torch.Tensor, h: int, D: int, kind: str,
             _, _, c, sc, _, _, kt = _quant_native(xb, xb, xb)
             if kind == "v":
                 _, _, _, _, c, sc, _ = _quant_native(xb, xb, xb)
-        c = c.reshape(h, logical_n, D).permute(1, 0, 2).contiguous()
-        if logical_n < n:
-            c = torch.cat((c, torch.zeros((n - logical_n, h, D), device=x.device, dtype=c.dtype)), dim=0)
-        sc = sc.reshape(h, logical_n // blk).contiguous()
+        c_quant = c.reshape(h, quant_n, D).permute(1, 0, 2).contiguous()
+        c = torch.zeros((n, h, D), device=x.device, dtype=c_quant.dtype)
+        c[:logical_n].copy_(c_quant[:logical_n])
+        sc = sc.reshape(h, quant_n // blk).contiguous()
         codes.append(c)
         scales.append(sc)
-        max_blocks = max(max_blocks, n // blk)
+        max_blocks = max(max_blocks, quant_n // blk)
         if want_twin:
-            t = twin_pi(c.reshape(h, n, D)).contiguous()
+            t_quant = twin_pi(c_quant.reshape(h, quant_n, D)).contiguous()
+            t = torch.zeros((h, D, n), device=x.device, dtype=t_quant.dtype)
+            t[:, :, :logical_n].copy_(t_quant[:, :, :logical_n])
             twin.append(t)
     packed = torch.cat(codes, dim=0) if codes else torch.empty((0, h, D), device=x.device, dtype=torch.float8_e4m3fn)
     # A varlen tile can cover masked keys beyond a sequence's logical end.
@@ -140,15 +150,25 @@ def quantize_packed(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     v8, v8s, _ = _pack_one(v, cu_seqlens_k, v.shape[1], D, "v", bn, False, used_k)
     if max_seqlen_q is not None and q8s.size(2) < (int(max_seqlen_q) + bm - 1) // bm:
         q8s = torch.nn.functional.pad(q8s, (0, (int(max_seqlen_q) + bm - 1) // bm - q8s.size(2)), value=1.0)
-    if max_seqlen_k is not None and k8s.size(2) < (int(max_seqlen_k) + bn - 1) // bn:
-        pad = (int(max_seqlen_k) + bn - 1) // bn - k8s.size(2)
+    if max_seqlen_k is not None:
+        # The hd128 forward kernel stages K/V scale rows in 256-token
+        # descriptor tiles, even though their quantization block is 64.
+        k_scale_tokens = int(max_seqlen_k)
+        if D == 128:
+            k_scale_tokens = ((k_scale_tokens + 255) // 256) * 256
+        needed_k_blocks = (k_scale_tokens + bn - 1) // bn
+    else:
+        needed_k_blocks = k8s.size(2)
+    if k8s.size(2) < needed_k_blocks:
+        pad = needed_k_blocks - k8s.size(2)
         k8s = torch.nn.functional.pad(k8s, (0, pad), value=1.0)
         v8s = torch.nn.functional.pad(v8s, (0, pad), value=1.0)
     return {"q8": q8, "q8s": q8s, "k8": k8, "k8s": k8s, "v8": v8, "v8s": v8s,
             "q_t": qt, "k_t": kt}
 
 
-def quantize_dout_packed(dout: torch.Tensor, cu_seqlens_q: torch.Tensor):
+def quantize_dout_packed(dout: torch.Tensor, cu_seqlens_q: torch.Tensor,
+                         max_seqlen_q: int | None = None):
     """Quantize packed dO using the Q-side row-block recipe."""
     if dout.dim() != 3 or dout.dtype != torch.bfloat16:
         raise TypeError("delta_matching: packed dO must be bfloat16 [total, heads, d]")
@@ -156,4 +176,8 @@ def quantize_dout_packed(dout: torch.Tensor, cu_seqlens_q: torch.Tensor):
     do8, do8s, dot = _pack_one(
         dout, cu_seqlens_q, dout.shape[1], dout.shape[2], "q", bm, True
     )
+    if max_seqlen_q is not None:
+        needed = (int(max_seqlen_q) + bm - 1) // bm
+        if do8s.size(2) < needed:
+            do8s = torch.nn.functional.pad(do8s, (0, needed - do8s.size(2)), value=1.0)
     return {"do8": do8, "do8s": do8s, "dot": dot}

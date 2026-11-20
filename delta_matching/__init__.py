@@ -109,7 +109,7 @@ class _VarlenForward(torch.autograd.Function):
                 ctx, grad_o, q, k, v, cu_q, cu_k, q8, k8, v8,
                 q8s, k8s, v8s, qt, kt, lse, o, blocks
             )
-        do = quantize_dout_packed(grad_o.contiguous(), cu_q)
+        do = quantize_dout_packed(grad_o.contiguous(), cu_q, ctx.max_q)
         # Stale mode uses the standard row reduction delta = rowsum(dO * O).
         delta = (grad_o.float() * o.float()).sum(dim=-1)
         dq, dk, dv = _ops().bwd_fp8_varlen(
@@ -130,11 +130,6 @@ class _VarlenForward(torch.autograd.Function):
         k_storage = [int(x) for x in (cu_k[1:] - cu_k[:-1]).detach().cpu().tolist()]
         bm, bn = blocks_fn(q.shape[-1])
         for i, (nq, nk) in enumerate(zip(used_q, used_k)):
-            if nq % bm != 0 or nk % bn != 0:
-                raise ValueError(
-                    "delta_matching: seqused lengths must align to the FP8 quantization blocks "
-                    f"(sequence {i}: q={nq}, k={nk}, blocks={bm}/{bn})"
-                )
             if nq > q_storage[i] or nk > k_storage[i]:
                 raise ValueError("delta_matching: seqused lengths exceed their packed storage")
 
@@ -161,19 +156,24 @@ class _VarlenForward(torch.autograd.Function):
                 device=cu_q.device,
                 dtype=cu_q.dtype,
             ),
+            ctx.max_q,
         )
 
-        def compact_scales(scales, lengths, block):
-            max_blocks = max(lengths[i] // block for i in active)
+        def compact_scales(scales, lengths, block, target_tokens):
+            max_blocks = max(
+                max((lengths[i] + block - 1) // block for i in active),
+                (target_tokens + block - 1) // block,
+            )
             result = torch.ones((len(active), scales.shape[1], max_blocks), device=scales.device, dtype=scales.dtype)
             for dst, src in enumerate(active):
-                nblocks = lengths[src] // block
+                nblocks = (lengths[src] + block - 1) // block
                 result[dst, :, :nblocks].copy_(scales[src, :, :nblocks])
             return result.contiguous()
 
-        q8s_active = compact_scales(q8s, used_q, bm)
-        k8s_active = compact_scales(k8s, used_k, bn)
-        v8s_active = compact_scales(v8s, used_k, bn)
+        q8s_active = compact_scales(q8s, used_q, bm, ctx.max_q)
+        k_target = ctx.max_k if q.shape[-1] == 256 else ((ctx.max_k + 255) // 256) * 256
+        k8s_active = compact_scales(k8s, used_k, bn, k_target)
+        v8s_active = compact_scales(v8s, used_k, bn, k_target)
         cu_q_active = torch.tensor(
             [0] + [sum(used_q[i] for i in active[:j + 1]) for j in range(len(active))],
             device=cu_q.device,
@@ -213,10 +213,10 @@ def flash_attn_varlen_func(
     """FA3-shaped packed varlen forward entry point.
 
     This native path supports packed bf16 Q/K/V, causal or full attention,
-    GQA/MQA, explicit ``seqused_q``/``seqused_k`` logical prefixes, and the
-    stale-delta autograd backward path.  Non-empty logical sequences currently
-    require quantization-block-aligned lengths.  Unsupported FA3 options are
-    rejected explicitly until their kernel paths are implemented.
+    GQA/MQA, arbitrary non-empty ragged lengths, explicit
+    ``seqused_q``/``seqused_k`` logical prefixes, and the stale-delta autograd
+    backward path. Unsupported FA3 options are rejected explicitly until their
+    kernel paths are implemented.
     """
     if not all(isinstance(t, torch.Tensor) for t in (q, k, v, cu_seqlens_q, cu_seqlens_k)):
         raise TypeError("delta_matching: varlen q, k, v and cu_seqlens must be tensors")
