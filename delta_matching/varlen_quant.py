@@ -3,8 +3,8 @@
 This module is deliberately separate from the fixed-shape producers.  It provides the
 layout needed by the native varlen CUDA path: codes are concatenated in sequence order,
 while scale rows are padded to one common block count per batch.  The current kernels
-require sequence lengths to be multiples of their quantization block.  Tail masking will
-be added to the native producer once the varlen CUDA op is wired up.
+require non-empty sequence lengths to be multiples of their quantization block. Empty
+segments are retained in the metadata and produce no codes or twin columns.
 """
 from __future__ import annotations
 

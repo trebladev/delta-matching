@@ -17,6 +17,14 @@ def test_validate_packed_gqa_and_different_lengths():
     validate_packed_inputs(*_inputs())
 
 
+def test_validate_packed_allows_empty_segments():
+    q = torch.empty(4, 4, 128, dtype=torch.bfloat16)
+    k = torch.empty(4, 2, 128, dtype=torch.bfloat16)
+    v = torch.empty_like(k)
+    cu = torch.tensor([0, 0, 4], dtype=torch.int32)
+    validate_packed_inputs(q, k, v, cu, cu)
+
+
 @pytest.mark.parametrize("bad", ["dtype", "heads", "offsets"])
 def test_validate_packed_rejects_bad_shapes(bad):
     q, k, v, cq, ck = _inputs()

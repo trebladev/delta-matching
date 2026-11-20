@@ -120,10 +120,10 @@ def flash_attn_varlen_func(
 ):
     """FA3-shaped packed varlen forward entry point.
 
-    This initial native path supports packed bf16 Q/K/V, causal or full attention,
-    and GQA/MQA.  It currently requires every sequence length to be a positive
-    quantization-block multiple and is forward-only.  Unsupported FA3 options are
-    rejected explicitly until their kernel paths are implemented.
+    This native path supports packed bf16 Q/K/V, causal or full attention,
+    GQA/MQA, and the stale-delta autograd backward path.  Non-empty sequences
+    currently require quantization-block-aligned lengths.  Unsupported FA3
+    options are rejected explicitly until their kernel paths are implemented.
     """
     if not all(isinstance(t, torch.Tensor) for t in (q, k, v, cu_seqlens_q, cu_seqlens_k)):
         raise TypeError("delta_matching: varlen q, k, v and cu_seqlens must be tensors")
