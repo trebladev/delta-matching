@@ -346,7 +346,12 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8_varlen(
     p.scale_softmax = 1.0f; p.is_causal = is_causal; p.is_bf16 = true;
     p.varlen_sort_batches = true;
     p.head_swizzle = is_causal;
-    p.prepare_varlen_pdl = true;
+    // The custom FP8 forward consumes the scheduler metadata through ordinary
+    // global loads.  Keep the preparation and attention launches ordered on
+    // the current stream until this path has a matching dependent-grid
+    // contract.  This avoids a metadata visibility race for mixed causal
+    // sequence lengths.
+    p.prepare_varlen_pdl = false;
     p.q_ptr = q_work.data_ptr(); p.k_ptr = k_work.data_ptr(); p.v_ptr = v_work.data_ptr();
     p.q_row_stride = q_work.stride(0); p.q_head_stride = q_work.stride(1); p.q_batch_stride = 0;
     p.k_row_stride = k_work.stride(0); p.k_head_stride = k_work.stride(1); p.k_batch_stride = 0;
