@@ -233,7 +233,9 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8_varlen(
     at::Tensor q8s, at::Tensor k8s, at::Tensor v8s,
     at::Tensor cu_seqlens_q, at::Tensor cu_seqlens_k,
     int64_t max_seqlen_q, int64_t max_seqlen_k,
-    double softmax_scale, bool is_causal
+    double softmax_scale, bool is_causal,
+    c10::optional<at::Tensor> seqused_q_opt,
+    c10::optional<at::Tensor> seqused_k_opt
 ) {
     c10::cuda::CUDAGuard device_guard(q8.device());
     dm_check_inputs("fwd_varlen", q8, {k8, v8, q8s, k8s, v8s, cu_seqlens_q, cu_seqlens_k});
@@ -294,7 +296,24 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8_varlen(
         return {empty_o, empty_lse};
     }
     bool const needs_padding = (q8.size(0) != b * int(max_seqlen_q)) ||
-                               (k8.size(0) != b * int(max_seqlen_k));
+                               (k8.size(0) != b * int(max_seqlen_k)) ||
+                               seqused_q_opt.has_value() || seqused_k_opt.has_value();
+    if (seqused_q_opt.has_value() || seqused_k_opt.has_value()) {
+        TORCH_CHECK(seqused_q_opt.has_value() && seqused_k_opt.has_value(),
+                    "delta_matching fwd_varlen: seqused_q and seqused_k must be provided together");
+        auto sq = *seqused_q_opt, sk = *seqused_k_opt;
+        TORCH_CHECK(sq.is_cuda() && sk.is_cuda() && sq.device() == q8.device() && sk.device() == q8.device(),
+                    "delta_matching fwd_varlen: seqused tensors must be on the input CUDA device");
+        TORCH_CHECK(sq.dim() == 1 && sk.dim() == 1 && sq.numel() == b && sk.numel() == b,
+                    "delta_matching fwd_varlen: seqused tensors must be int32 vectors of batch length");
+        TORCH_CHECK(sq.scalar_type() == at::kInt && sk.scalar_type() == at::kInt && sq.is_contiguous() && sk.is_contiguous(),
+                    "delta_matching fwd_varlen: seqused tensors must be contiguous int32");
+        for (int i = 0; i < b; ++i) {
+            TORCH_CHECK(sq[i].item<int>() >= 0 && sq[i].item<int>() <= cu_seqlens_q[i + 1].item<int>() - cu_seqlens_q[i].item<int>() &&
+                        sk[i].item<int>() >= 0 && sk[i].item<int>() <= cu_seqlens_k[i + 1].item<int>() - cu_seqlens_k[i].item<int>(),
+                        "delta_matching fwd_varlen: seqused values must be within packed sequence lengths");
+        }
+    }
     at::Tensor q_work = q8, k_work = k8, v_work = v8;
     at::Tensor cu_work = cu_seqlens_q, cu_k_work = cu_seqlens_k, used_q, used_k;
     int work_q = q8.size(0), work_k = k8.size(0);
@@ -305,8 +324,8 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8_varlen(
             hkoff[i] = i * int(max_seqlen_k);
         }
         for (int i = 0; i < b; ++i) {
-            husedq[i] = cu_seqlens_q[i + 1].item<int>() - cu_seqlens_q[i].item<int>();
-            husedk[i] = cu_seqlens_k[i + 1].item<int>() - cu_seqlens_k[i].item<int>();
+            husedq[i] = seqused_q_opt.has_value() ? (*seqused_q_opt)[i].item<int>() : cu_seqlens_q[i + 1].item<int>() - cu_seqlens_q[i].item<int>();
+            husedk[i] = seqused_k_opt.has_value() ? (*seqused_k_opt)[i].item<int>() : cu_seqlens_k[i + 1].item<int>() - cu_seqlens_k[i].item<int>();
         }
         auto iopts = cu_seqlens_q.options();
         cu_work = torch::tensor(hq, iopts);
@@ -380,8 +399,8 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8_varlen(
     }
     auto lse = lse_packed_storage.transpose(0, 1).contiguous();
     if (!needs_padding) return {o, lse};
-    auto o_out = torch::empty({q8.size(0), h, d}, opts.dtype(at::kBFloat16));
-    auto lse_out = torch::empty({q8.size(0), h}, opts.dtype(at::kFloat));
+    auto o_out = torch::zeros({q8.size(0), h, d}, opts.dtype(at::kBFloat16));
+    auto lse_out = torch::full({q8.size(0), h}, -std::numeric_limits<float>::infinity(), opts.dtype(at::kFloat));
     for (int i = 0; i < b; ++i) {
         int const qs = cu_seqlens_q[i].item<int>();
         int const qn = used_q[i].item<int>();
@@ -998,7 +1017,7 @@ TORCH_LIBRARY(delta_matching, m) {
           " float softmax_scale, bool is_causal) -> (Tensor, Tensor)");
     m.def("fwd_fp8_varlen(Tensor q8, Tensor k8, Tensor v8, Tensor q8s, Tensor k8s, Tensor v8s,"
           " Tensor cu_seqlens_q, Tensor cu_seqlens_k, int max_seqlen_q, int max_seqlen_k,"
-          " float softmax_scale, bool is_causal) -> (Tensor, Tensor)");
+          " float softmax_scale, bool is_causal, Tensor? seqused_q=None, Tensor? seqused_k=None) -> (Tensor, Tensor)");
     m.def("bwd_fp8(Tensor dout8, Tensor q8, Tensor k8, Tensor v8, Tensor lse, Tensor delta,"
           " Tensor kt8, Tensor q8s, Tensor k8s, Tensor v8s, Tensor do8s,"
           " float softmax_scale, bool is_causal) -> (Tensor, Tensor, Tensor)");

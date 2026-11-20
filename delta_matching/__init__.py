@@ -81,14 +81,16 @@ class _VarlenForward(torch.autograd.Function):
     """Packed varlen native forward and stale backward bridge."""
 
     @staticmethod
-    def forward(ctx, q, k, v, cu_q, cu_k, max_q, max_k, causal):
+    def forward(ctx, q, k, v, cu_q, cu_k, max_q, max_k, causal, seqused_q=None, seqused_k=None):
         from .varlen_quant import quantize_packed
         from .core import _ops
 
-        p = quantize_packed(q, k, v, cu_q, cu_k, max_q, max_k)
+        ctx.seqused_q, ctx.seqused_k = seqused_q, seqused_k
+        p = quantize_packed(q, k, v, cu_q, cu_k, max_q, max_k, ctx.seqused_q, ctx.seqused_k)
         o, lse = _ops().fwd_fp8_varlen(
             p["q8"], p["k8"], p["v8"], p["q8s"], p["k8s"], p["v8s"],
-            cu_q, cu_k, int(max_q), int(max_k), float(q.shape[-1] ** -0.5), bool(causal)
+            cu_q, cu_k, int(max_q), int(max_k), float(q.shape[-1] ** -0.5), bool(causal),
+            ctx.seqused_q, ctx.seqused_k
         )
         ctx.save_for_backward(q, k, v, cu_q, cu_k, p["q8"], p["k8"], p["v8"],
                               p["q8s"], p["k8s"], p["v8s"], p["q_t"], p["k_t"], lse, o)
@@ -98,9 +100,15 @@ class _VarlenForward(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_o):
         from .varlen_quant import quantize_dout_packed
+        from .varlen_quant import blocks
         from .core import _ops
         (q, k, v, cu_q, cu_k, q8, k8, v8, q8s, k8s, v8s,
          qt, kt, lse, o) = ctx.saved_tensors
+        if ctx.seqused_q is not None:
+            return _VarlenForward._backward_seqused(
+                ctx, grad_o, q, k, v, cu_q, cu_k, q8, k8, v8,
+                q8s, k8s, v8s, qt, kt, lse, o, blocks
+            )
         do = quantize_dout_packed(grad_o.contiguous(), cu_q)
         # Stale mode uses the standard row reduction delta = rowsum(dO * O).
         delta = (grad_o.float() * o.float()).sum(dim=-1)
@@ -108,7 +116,91 @@ class _VarlenForward(torch.autograd.Function):
             do["do8"], q8, k8, v8, lse, delta, kt, qt, do["dot"],
             q8s, k8s, v8s, do["do8s"], cu_q, cu_k,
             ctx.max_q, ctx.max_k, float(q.shape[-1] ** -0.5), ctx.causal)
-        return dq, dk, dv, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None
+
+    @staticmethod
+    def _backward_seqused(ctx, grad_o, q, k, v, cu_q, cu_k, q8, k8, v8,
+                          q8s, k8s, v8s, qt, kt, lse, o, blocks_fn):
+        from .varlen_quant import quantize_dout_packed
+        from .core import _ops
+
+        used_q = [int(x) for x in ctx.seqused_q.detach().cpu().tolist()]
+        used_k = [int(x) for x in ctx.seqused_k.detach().cpu().tolist()]
+        q_storage = [int(x) for x in (cu_q[1:] - cu_q[:-1]).detach().cpu().tolist()]
+        k_storage = [int(x) for x in (cu_k[1:] - cu_k[:-1]).detach().cpu().tolist()]
+        bm, bn = blocks_fn(q.shape[-1])
+        for i, (nq, nk) in enumerate(zip(used_q, used_k)):
+            if nq % bm != 0 or nk % bn != 0:
+                raise ValueError(
+                    "delta_matching: seqused lengths must align to the FP8 quantization blocks "
+                    f"(sequence {i}: q={nq}, k={nk}, blocks={bm}/{bn})"
+                )
+            if nq > q_storage[i] or nk > k_storage[i]:
+                raise ValueError("delta_matching: seqused lengths exceed their packed storage")
+
+        active = [i for i, (nq, nk) in enumerate(zip(used_q, used_k)) if nq > 0 and nk > 0]
+        if not active:
+            return torch.zeros_like(q), torch.zeros_like(k), torch.zeros_like(v), None, None, None, None, None, None, None
+
+        def compact_tokens(x, cu, lengths):
+            return torch.cat([x.narrow(0, int(cu[i]), lengths[i]) for i in active], dim=0).contiguous()
+
+        q8_active = compact_tokens(q8, cu_q, used_q)
+        k8_active = compact_tokens(k8, cu_k, used_k)
+        v8_active = compact_tokens(v8, cu_k, used_k)
+        do_active_bf16 = compact_tokens(grad_o, cu_q, used_q)
+        qt_active = torch.cat([qt.narrow(2, int(cu_q[i]), used_q[i]) for i in active], dim=2).contiguous()
+        kt_active = torch.cat([kt.narrow(2, int(cu_k[i]), used_k[i]) for i in active], dim=2).contiguous()
+        lse_active = torch.cat([lse.narrow(0, int(cu_q[i]), used_q[i]) for i in active], dim=0).contiguous()
+        o_active = torch.cat([o.narrow(0, int(cu_q[i]), used_q[i]) for i in active], dim=0).contiguous()
+        delta_active = (do_active_bf16.float() * o_active.float()).sum(dim=-1)
+        do_active = quantize_dout_packed(
+            do_active_bf16,
+            torch.tensor(
+                [0] + [sum(used_q[i] for i in active[:j + 1]) for j in range(len(active))],
+                device=cu_q.device,
+                dtype=cu_q.dtype,
+            ),
+        )
+
+        def compact_scales(scales, lengths, block):
+            max_blocks = max(lengths[i] // block for i in active)
+            result = torch.ones((len(active), scales.shape[1], max_blocks), device=scales.device, dtype=scales.dtype)
+            for dst, src in enumerate(active):
+                nblocks = lengths[src] // block
+                result[dst, :, :nblocks].copy_(scales[src, :, :nblocks])
+            return result.contiguous()
+
+        q8s_active = compact_scales(q8s, used_q, bm)
+        k8s_active = compact_scales(k8s, used_k, bn)
+        v8s_active = compact_scales(v8s, used_k, bn)
+        cu_q_active = torch.tensor(
+            [0] + [sum(used_q[i] for i in active[:j + 1]) for j in range(len(active))],
+            device=cu_q.device,
+            dtype=cu_q.dtype,
+        )
+        cu_k_active = torch.tensor(
+            [0] + [sum(used_k[i] for i in active[:j + 1]) for j in range(len(active))],
+            device=cu_k.device,
+            dtype=cu_k.dtype,
+        )
+        dq, dk, dv = _ops().bwd_fp8_varlen(
+            do_active["do8"], q8_active, k8_active, v8_active, lse_active, delta_active,
+            kt_active, qt_active, do_active["dot"], q8s_active, k8s_active, v8s_active,
+            do_active["do8s"], cu_q_active, cu_k_active, ctx.max_q, ctx.max_k,
+            float(q.shape[-1] ** -0.5), ctx.causal,
+        )
+        dq_full = torch.zeros_like(q)
+        dk_full = torch.zeros_like(k)
+        dv_full = torch.zeros_like(v)
+        q_pos = k_pos = 0
+        for i in active:
+            dq_full.narrow(0, int(cu_q[i]), used_q[i]).copy_(dq.narrow(0, q_pos, used_q[i]))
+            dk_full.narrow(0, int(cu_k[i]), used_k[i]).copy_(dk.narrow(0, k_pos, used_k[i]))
+            dv_full.narrow(0, int(cu_k[i]), used_k[i]).copy_(dv.narrow(0, k_pos, used_k[i]))
+            q_pos += used_q[i]
+            k_pos += used_k[i]
+        return dq_full, dk_full, dv_full, None, None, None, None, None, None, None
 
 
 def flash_attn_varlen_func(
@@ -121,9 +213,10 @@ def flash_attn_varlen_func(
     """FA3-shaped packed varlen forward entry point.
 
     This native path supports packed bf16 Q/K/V, causal or full attention,
-    GQA/MQA, and the stale-delta autograd backward path.  Non-empty sequences
-    currently require quantization-block-aligned lengths.  Unsupported FA3
-    options are rejected explicitly until their kernel paths are implemented.
+    GQA/MQA, explicit ``seqused_q``/``seqused_k`` logical prefixes, and the
+    stale-delta autograd backward path.  Non-empty logical sequences currently
+    require quantization-block-aligned lengths.  Unsupported FA3 options are
+    rejected explicitly until their kernel paths are implemented.
     """
     if not all(isinstance(t, torch.Tensor) for t in (q, k, v, cu_seqlens_q, cu_seqlens_k)):
         raise TypeError("delta_matching: varlen q, k, v and cu_seqlens must be tensors")
@@ -135,15 +228,22 @@ def flash_attn_varlen_func(
         raise NotImplementedError("delta_matching: this varlen path does not implement chunking, softcap, splits, or pack_gqa")
     if return_attn_probs:
         raise NotImplementedError("delta_matching: return_attn_probs is not implemented for varlen")
-    if seqused_q is not None or seqused_k is not None or sm_margin != 0:
-        raise NotImplementedError("delta_matching: seqused and sm_margin are not implemented for varlen")
+    if (seqused_q is None) != (seqused_k is None):
+        raise ValueError("delta_matching: seqused_q and seqused_k must be provided together")
+    if seqused_q is not None:
+        for name, t in (("seqused_q", seqused_q), ("seqused_k", seqused_k)):
+            if t.dim() != 1 or t.numel() != cu_seqlens_q.numel() - 1 or t.dtype != torch.int32 or not t.is_contiguous():
+                raise ValueError(f"delta_matching: {name} must be contiguous int32 with one value per batch")
+    if sm_margin != 0:
+        raise NotImplementedError("delta_matching: sm_margin is not implemented for varlen")
     if softmax_scale is not None and abs(float(softmax_scale) - q.shape[-1] ** -0.5) > 1e-12:
         raise NotImplementedError("delta_matching: softmax_scale is fixed at head_dim ** -0.5")
     if deterministic not in (False, True):
         raise TypeError("delta_matching: deterministic must be bool")
     if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
         raise TypeError("delta_matching: packed varlen q, k, v must be torch.bfloat16")
-    return _VarlenForward.apply(q, k, v, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), int(max_seqlen_k), bool(causal))
+    result = _VarlenForward.apply(q, k, v, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), int(max_seqlen_k), bool(causal), seqused_q, seqused_k)
+    return result
 
 
 def kernel_version():

@@ -325,7 +325,10 @@ fq8_dq_pass2_kernel_hd128(CUTE_GRID_CONSTANT P2Params const params) {
         // (both predicates are strictly colder than any healthy psi ratio).
         // A skipped tile is TRANSPARENT to the window (see header): it
         // contributes exact zeros and leaves psi_w/psi_max untouched.
-        if (psi_cur != 0.0f && !(psi_cur < psi_max * 1e-8f)) {
+        // Treat non-finite scale metadata like the pass-1 zero-tile sentinel.
+        // Varlen rows can have no producer for padded/empty tiles, and reading
+        // those slots must not seed the ratio chain with NaN or Inf.
+        if (isfinite(psi_cur) && psi_cur != 0.0f && !(psi_cur < psi_max * 1e-8f)) {
             if (psi_w != 0.0f) {   // not the window's first taken tile
                 float ratio = psi_w / psi_cur;
                 ratio = fminf(fmaxf(ratio, 1e-8f), 1e8f);

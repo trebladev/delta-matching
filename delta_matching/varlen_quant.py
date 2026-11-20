@@ -56,23 +56,25 @@ def validate_packed_inputs(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
 
 
 def _pack_one(x: torch.Tensor, cu: torch.Tensor, h: int, D: int, kind: str,
-              blk: int, want_twin: bool):
+              blk: int, want_twin: bool, used_lengths=None):
     codes, scales, twin = [], [], []
     max_blocks = 0
     for b in range(cu.numel() - 1):
         lo, hi = int(cu[b]), int(cu[b + 1])
         n = hi - lo
-        if n < 0 or (n > 0 and n % blk):
+        logical_n = n if used_lengths is None else int(used_lengths[b])
+        if n < 0 or logical_n < 0 or logical_n > n or (n > 0 and n % blk) or (logical_n > 0 and logical_n % blk):
             raise ValueError(f"delta_matching: {kind} sequence lengths must be nonnegative {blk}-multiples (got {n})")
-        if n == 0:
+        if n == 0 or logical_n == 0:
             # FA3 permits empty segments.  There is no producer work or twin
             # tile for such a segment, but its padded scale row is retained.
             scales.append(torch.empty((h, 0), device=x.device, dtype=torch.float32))
-            max_blocks = max(max_blocks, 0)
+            codes.append(torch.zeros((n, h, D), device=x.device, dtype=torch.float8_e4m3fn))
+            max_blocks = max(max_blocks, logical_n // blk)
             if want_twin:
-                twin.append(torch.empty((h, D, 0), device=x.device, dtype=torch.float8_e4m3fn))
+                twin.append(torch.zeros((h, D, n), device=x.device, dtype=torch.float8_e4m3fn))
             continue
-        xb = x[lo:hi].permute(1, 0, 2).contiguous().unsqueeze(0)
+        xb = x[lo:lo + logical_n].permute(1, 0, 2).contiguous().unsqueeze(0)
         if kind == "q":
             q8, s, _, = _quant_native(xb, xb, xb)[:3]
             # _quant_native quantizes all three operands.  Keep its Q result only.
@@ -83,8 +85,10 @@ def _pack_one(x: torch.Tensor, cu: torch.Tensor, h: int, D: int, kind: str,
             _, _, c, sc, _, _, kt = _quant_native(xb, xb, xb)
             if kind == "v":
                 _, _, _, _, c, sc, _ = _quant_native(xb, xb, xb)
-        c = c.reshape(h, n, D).permute(1, 0, 2).contiguous()
-        sc = sc.reshape(h, n // blk).contiguous()
+        c = c.reshape(h, logical_n, D).permute(1, 0, 2).contiguous()
+        if logical_n < n:
+            c = torch.cat((c, torch.zeros((n - logical_n, h, D), device=x.device, dtype=c.dtype)), dim=0)
+        sc = sc.reshape(h, logical_n // blk).contiguous()
         codes.append(c)
         scales.append(sc)
         max_blocks = max(max_blocks, n // blk)
@@ -105,10 +109,13 @@ def _pack_one(x: torch.Tensor, cu: torch.Tensor, h: int, D: int, kind: str,
 
 def quantize_packed(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                     cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor,
-                    max_seqlen_q: int | None = None, max_seqlen_k: int | None = None):
+                    max_seqlen_q: int | None = None, max_seqlen_k: int | None = None,
+                    seqused_q: torch.Tensor | None = None, seqused_k: torch.Tensor | None = None):
     """Quantize packed ``q``, ``k`` and ``v`` for a native varlen launch.
 
     Inputs use FlashAttention's packed layout ``(total_tokens, heads, head_dim)``.
+    When ``seqused_q``/``seqused_k`` are supplied, only each sequence's logical
+    prefix is quantized and the physical suffix is filled with zero codes.
     The returned code tensors use the same layout.  Scale tensors are padded to the
     largest block count in the corresponding batch.  ``q_t``/``k_t`` use the kernel's
     pi-ordered twin layout ``(heads, head_dim, total_tokens)``.
@@ -119,10 +126,18 @@ def quantize_packed(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     D = q.shape[2]
     _validate_cu(cu_seqlens_q, q.shape[0], "cu_seqlens_q")
     _validate_cu(cu_seqlens_k, k.shape[0], "cu_seqlens_k")
+    if (seqused_q is None) != (seqused_k is None):
+        raise ValueError("delta_matching: seqused_q and seqused_k must be provided together")
+    used_q = used_k = None
+    if seqused_q is not None:
+        used_q = [int(x) for x in seqused_q.detach().cpu().tolist()]
+        used_k = [int(x) for x in seqused_k.detach().cpu().tolist()]
+        if len(used_q) != cu_seqlens_q.numel() - 1 or len(used_k) != cu_seqlens_k.numel() - 1:
+            raise ValueError("delta_matching: seqused tensors must have one value per batch")
     bm, bn = blocks(D)
-    q8, q8s, qt = _pack_one(q, cu_seqlens_q, q.shape[1], D, "q", bm, True)
-    k8, k8s, kt = _pack_one(k, cu_seqlens_k, k.shape[1], D, "k", bn, True)
-    v8, v8s, _ = _pack_one(v, cu_seqlens_k, v.shape[1], D, "v", bn, False)
+    q8, q8s, qt = _pack_one(q, cu_seqlens_q, q.shape[1], D, "q", bm, True, used_q)
+    k8, k8s, kt = _pack_one(k, cu_seqlens_k, k.shape[1], D, "k", bn, True, used_k)
+    v8, v8s, _ = _pack_one(v, cu_seqlens_k, v.shape[1], D, "v", bn, False, used_k)
     if max_seqlen_q is not None and q8s.size(2) < (int(max_seqlen_q) + bm - 1) // bm:
         q8s = torch.nn.functional.pad(q8s, (0, (int(max_seqlen_q) + bm - 1) // bm - q8s.size(2)), value=1.0)
     if max_seqlen_k is not None and k8s.size(2) < (int(max_seqlen_k) + bn - 1) // bn:

@@ -9,3 +9,11 @@ def test_varlen_options_rejected_without_cuda():
     cu = torch.tensor([0, 1], dtype=torch.int32)
     with pytest.raises((ValueError, TypeError, NotImplementedError, RuntimeError)):
         flash_attn_varlen_func(q, q, q, cu, cu, 1, 1, window_size=(1, -1))
+
+
+def test_varlen_seqused_requires_a_pair():
+    q = torch.empty(1, 1, 128, dtype=torch.bfloat16)
+    cu = torch.tensor([0, 1], dtype=torch.int32)
+    used = torch.tensor([1], dtype=torch.int32)
+    with pytest.raises(ValueError, match="provided together"):
+        flash_attn_varlen_func(q, q, q, cu, cu, 1, 1, seqused_q=used)
