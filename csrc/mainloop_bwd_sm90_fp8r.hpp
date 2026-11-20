@@ -102,7 +102,7 @@ namespace flash {
 
 using namespace cute;
 
-template <int Stages, int Stages_dO, int Stages_dOt, bool Is_causal_>
+template <int Stages, int Stages_dO, int Stages_dOt, bool Is_causal_, bool Varlen_ = false>
 struct CollectiveMainloopBwdSm90Fp8R {
     using Element = cutlass::float_e4m3_t;
     // ## bf16-dP: SageBwd's single exemption. dP = dO V^T is computed in bf16 from the RAW
@@ -136,7 +136,7 @@ struct CollectiveMainloopBwdSm90Fp8R {
     static constexpr bool Is_causal = Is_causal_;
     static constexpr bool Is_local = false;
     static constexpr bool Has_softcap = false;
-    static constexpr bool Varlen = false;
+    static constexpr bool Varlen = Varlen_;
     static constexpr bool DeltaPass0 = false;
     static constexpr int kAbl = 0;
     static constexpr bool Q_dO_same_stages = kStages == kStages_dO;
@@ -456,16 +456,17 @@ struct CollectiveMainloopBwdSm90Fp8R {
         Tensor sdOt = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_dot.data()), SmemLayoutdOt{});
 
         int bidh_kv = params.qhead_per_khead_divmod.divide(bidh);
-        Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh, bidb);
-        Tensor mdO = params.tma_load_dO.get_tma_tensor(params.shape_dO)(_, _, bidh, bidb);
-        Tensor mK = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, bidb);
-        Tensor mV = params.tma_load_V.get_tma_tensor(params.shape_V)(_, _, bidh_kv, bidb);
+        int const tensor_bidb = Varlen ? 0 : bidb;
+        Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh, tensor_bidb);
+        Tensor mdO = params.tma_load_dO.get_tma_tensor(params.shape_dO)(_, _, bidh, tensor_bidb);
+        Tensor mK = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, tensor_bidb);
+        Tensor mV = params.tma_load_V.get_tma_tensor(params.shape_V)(_, _, bidh_kv, tensor_bidb);
         auto shape_Qt = make_shape(get<1>(params.shape_Q), get<0>(params.shape_Q), get<2>(params.shape_Q), get<3>(params.shape_Q));
         auto shape_dOt = make_shape(get<1>(params.shape_dO), get<0>(params.shape_dO), get<2>(params.shape_dO), get<3>(params.shape_dO));
-        Tensor mQt = params.tma_load_Qt.get_tma_tensor(shape_Qt)(_, _, bidh, bidb);
-        Tensor mdOt = params.tma_load_dOt.get_tma_tensor(shape_dOt)(_, _, bidh, bidb);
-        Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE_log2), params.shape_LSE, params.stride_LSE_log2)(_, bidh, bidb);
-        Tensor mdPsum = make_tensor(make_gmem_ptr(params.ptr_dPsum), params.shape_LSE, params.stride_dPsum)(_, bidh, bidb);
+        Tensor mQt = params.tma_load_Qt.get_tma_tensor(shape_Qt)(_, _, bidh, tensor_bidb);
+        Tensor mdOt = params.tma_load_dOt.get_tma_tensor(shape_dOt)(_, _, bidh, tensor_bidb);
+        Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE_log2), params.shape_LSE, params.stride_LSE_log2)(_, bidh, tensor_bidb);
+        Tensor mdPsum = make_tensor(make_gmem_ptr(params.ptr_dPsum), params.shape_LSE, params.stride_dPsum)(_, bidh, tensor_bidb);
 
         Tensor gQ = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));
         Tensor gdO = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mdO), select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));

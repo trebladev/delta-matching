@@ -59,7 +59,7 @@ EXTRA_DEFINES = ["-DFA3FP11_M16_P0V2_ATOMN=64", "-DFA3FP11_HD128_P0V6=1", "-DFA3
 def defines():
     d = ["-DFLASHATTENTION_DISABLE_SM8x", "-DFLASHATTENTION_DISABLE_SPLIT", "-DFLASHATTENTION_DISABLE_PAGEDKV",
          "-DFLASHATTENTION_DISABLE_APPENDKV", "-DFLASHATTENTION_DISABLE_LOCAL", "-DFLASHATTENTION_DISABLE_SOFTCAP",
-         "-DFLASHATTENTION_DISABLE_PACKGQA", "-DFLASHATTENTION_DISABLE_FP16", "-DFLASHATTENTION_DISABLE_VARLEN",
+         "-DFLASHATTENTION_DISABLE_PACKGQA", "-DFLASHATTENTION_DISABLE_FP16",
          "-DFLASHATTENTION_DISABLE_CLUSTER", "-DFLASHATTENTION_DISABLE_HDIM64", "-DFLASHATTENTION_DISABLE_HDIM96",
          "-DFLASHATTENTION_DISABLE_HDIM128", "-DFLASHATTENTION_DISABLE_HDIM192", "-DFLASHATTENTION_DISABLE_HDIMDIFF64",
          "-DFLASHATTENTION_DISABLE_HDIMDIFF192",
@@ -77,7 +77,9 @@ def sources():
          "flash_delta_hdim256_e4m3_fp11_sm90.cu", "fp11_twin_kernel.cu",
          "flash_fwd_hdim128_e4m3_fp8f_sm90.cu", "flash_bwd_hdim128_e4m3_fp8v10_sm90.cu",
          "flash_delta_hdim128_e4m3_fp11v5_sm90.cu"]
-    return [os.path.join(CSRC, f) for f in s]
+    # FA3's packed-varlen persistent scheduler metadata helper.  The fixed
+    # length kernels never call it, but Varlen=true forward instances do.
+    return [os.path.join(CSRC, f) for f in s] + [os.path.join(ROOT, "third_party", "flash-attention", "hopper", "flash_prepare_scheduler.cu")]
 
 
 def include_dirs():
@@ -118,11 +120,11 @@ def _prefix_maps():
 
 def cxx_flags():
     """The host compiler flags (the api .cpp under setup.py, extra_cflags under the JIT build)."""
-    return ["-O3", "-std=c++17"] + _prefix_maps()
+    return ["-O3", "-std=c++20"] + _prefix_maps()
 
 
 def cuda_flags():
-    f = ["-O3", "-std=c++17", "--use_fast_math", "-DNDEBUG", "--expt-relaxed-constexpr",
+    f = ["-O3", "-std=c++20", "--use_fast_math", "-DNDEBUG", "--expt-relaxed-constexpr",
          "--expt-extended-lambda", "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED", "-DCUTLASS_ENABLE_GDC_FOR_SM90",
          "-DCUTLASS_DEBUG_TRACE_LEVEL=0", "--threads", "4", "-gencode", "arch=compute_90a,code=sm_90a"]
     if LINEINFO:

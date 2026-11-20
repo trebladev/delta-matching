@@ -7,3 +7,5 @@
 // other FA3-derived libraries; see the launch header).
 template void run_flash_bwd_fp11_d256<true>(Flash_bwd_fp8_params &params, cudaStream_t stream);
 template void run_flash_bwd_fp11_d256<false>(Flash_bwd_fp8_params &params, cudaStream_t stream);
+template void run_flash_bwd_fp11_varlen_d256<true>(Flash_bwd_fp8_params &params, cudaStream_t stream);
+template void run_flash_bwd_fp11_varlen_d256<false>(Flash_bwd_fp8_params &params, cudaStream_t stream);

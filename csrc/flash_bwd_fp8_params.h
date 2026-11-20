@@ -3,6 +3,11 @@
 #include "flash.h"
 
 struct Flash_bwd_fp8_params : public Flash_bwd_params {
+    // Packed varlen execution flag for the Delta-Matching pass-2 dQ kernel.
+    bool varlen = false;
+    // Packed token extents. These are only used when varlen is true.
+    int total_q = 0;
+    int total_k = 0;
     void const* qt_ptr;
     void const* kt_ptr;
     void const* dot_ptr;

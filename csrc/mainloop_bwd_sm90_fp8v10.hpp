@@ -835,7 +835,7 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
         Tensor mV = params.tma_load_V.get_tma_tensor(params.shape_V)(_, _, bidh_kv, !is_varlen_k ? bidb : 0);
         // ## FQ8-V9: only the K twin remains a gmem tensor.
         auto shape_Kt = make_shape(get<1>(params.shape_K), get<0>(params.shape_K), get<2>(params.shape_K), get<3>(params.shape_K));
-        Tensor mKt = params.tma_load_Kt.get_tma_tensor(shape_Kt)(_, _, bidh_kv, bidb);
+        Tensor mKt = params.tma_load_Kt.get_tma_tensor(shape_Kt)(_, _, bidh_kv, !is_varlen_k ? bidb : 0);
         Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE_log2), params.shape_LSE, params.stride_LSE_log2)(_, bidh, !is_varlen_q ? bidb : 0);
         Tensor mdPsum = make_tensor(make_gmem_ptr(params.ptr_dPsum), params.shape_LSE, params.stride_dPsum)(_, bidh, !is_varlen_q ? bidb : 0);
 
@@ -843,7 +843,7 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
         Tensor gdO = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mdO), select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (M, K, _)
         Tensor gK = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}), mK), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (N, K)
         Tensor gV = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}), mV), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (N, K)
-        Tensor gKt = local_tile(mKt, make_shape(Int<kHeadDim>{}, Int<kBlockN>{}), make_coord(_0{}, n_block));  // (D, N)
+        Tensor gKt = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}), mKt), make_shape(Int<kHeadDim>{}, Int<kBlockN>{}), make_coord(_0{}, n_block));  // (D, N)
         Tensor gLSE = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded), mLSE), select<0>(TileShape_MNK{}), make_coord(_));  // (M, _)
         Tensor gdPsum = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded), mdPsum), select<0>(TileShape_MNK{}), make_coord(_));  // (M, _)
 
@@ -1020,8 +1020,8 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
         // The twins are [d, seq, head, batch] (seq contiguous), (d, seq) = shape_Q's modes swapped.
         auto shape_Qt = make_shape(get<1>(params.shape_Q), get<0>(params.shape_Q), get<2>(params.shape_Q), get<3>(params.shape_Q));
         auto shape_dOt = make_shape(get<1>(params.shape_dO), get<0>(params.shape_dO), get<2>(params.shape_dO), get<3>(params.shape_dO));
-        Tensor mQt = params.tma_load_Qt.get_tma_tensor(shape_Qt)(_, _, bidh, bidb);
-        Tensor mdOt = params.tma_load_dOt.get_tma_tensor(shape_dOt)(_, _, bidh, bidb);
+        Tensor mQt = params.tma_load_Qt.get_tma_tensor(shape_Qt)(_, _, bidh, !is_varlen_q ? bidb : 0);
+        Tensor mdOt = params.tma_load_dOt.get_tma_tensor(shape_dOt)(_, _, bidh, !is_varlen_q ? bidb : 0);
         Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE_log2), params.shape_LSE, params.stride_LSE_log2)(_, bidh, !is_varlen_q ? bidb : 0);
         Tensor mdPsum = make_tensor(make_gmem_ptr(params.ptr_dPsum), params.shape_LSE, params.stride_dPsum)(_, bidh, !is_varlen_q ? bidb : 0);
 
@@ -1029,8 +1029,8 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
         Tensor gdO = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mdO), select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (M, K, _)
         Tensor gK = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}), mK), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (N, K)
         Tensor gV = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}), mV), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (N, K)
-        Tensor gQt = local_tile(mQt, make_shape(Int<kHeadDim>{}, Int<kBlockM>{}), make_coord(_0{}, _));    // (D, M, _)
-        Tensor gdOt = local_tile(mdOt, make_shape(Int<kHeadDim>{}, Int<kBlockM>{}), make_coord(_0{}, _));  // (D, M, _)
+        Tensor gQt = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mQt), make_shape(Int<kHeadDim>{}, Int<kBlockM>{}), make_coord(_0{}, _));    // (D, M, _)
+        Tensor gdOt = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mdOt), make_shape(Int<kHeadDim>{}, Int<kBlockM>{}), make_coord(_0{}, _));  // (D, M, _)
         Tensor gLSE = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded), mLSE), select<0>(TileShape_MNK{}), make_coord(_));  // (M, _)
         Tensor gdPsum = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded), mdPsum), select<0>(TileShape_MNK{}), make_coord(_));  // (M, _)
 

@@ -46,7 +46,7 @@ using namespace cute;
 // configuration verbatim (kBlockM 64, kBlockN 64); hd128 = kBlockM 64, kBlockN 128 (FA3's own hd128 bwd tile; each
 // MMA warpgroup owns a 64-key scale group), pass 2 = fq8_dq_pass2_hd128.h.
 // ## Delta-Matching-128 v2 (M20) P1-R launch: the RS pass 1 at hd128 (kBlockM 64, kBlockN 128) + the unchanged pass 2.
-template <bool Is_causal>
+template <bool Is_causal, bool Varlen>
 void run_flash_bwd_fp11r_hd128(Flash_bwd_fp8_params &params, cudaStream_t stream) {
     using Element = cutlass::float_e4m3_t;
     using ElementOut = cutlass::bfloat16_t;
@@ -58,61 +58,62 @@ void run_flash_bwd_fp11r_hd128(Flash_bwd_fp8_params &params, cudaStream_t stream
     int const seqlen_q = params.seqlen_q;
     int const seqlen_k = params.seqlen_k;
     int const seqlen_q_rounded = params.seqlen_q_rounded;
+    int const packed_b = Varlen ? 1 : params.b;
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using ClusterShape = cute::Shape<_1, Int<1>, _1>;
-    using CollectiveMainloop = flash::CollectiveMainloopBwdSm90Fp8R<FA3FP11_HD128_QST, FA3FP11_HD128_DOST, FA3FP11_HD128_DOTST, Is_causal>;
+    using CollectiveMainloop = flash::CollectiveMainloopBwdSm90Fp8R<FA3FP11_HD128_QST, FA3FP11_HD128_DOST, FA3FP11_HD128_DOTST, Is_causal, Varlen>;
     using CollectiveEpilogue = flash::CollectiveEpilogueBwd<
         TileShape_MNK, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads,
-        false /*Varlen*/, false /*dKV_swapAB*/, 1 /*AtomLayoutKdKV = NumMmaWarpGroups / AtomLayoutNdKV*/>;
+        Varlen, false /*dKV_swapAB*/, 1 /*AtomLayoutKdKV = NumMmaWarpGroups / AtomLayoutNdKV*/>;
     using Scheduler = std::conditional_t<
         Is_causal,
-        flash::SingleTileBwdLPTScheduler<false /*Varlen*/, kBlockN, false /*SPT*/>,
-        flash::SingleTileScheduler<false /*Varlen*/, false /*Split*/, false /*PackGQA*/, kBlockN>
+        flash::SingleTileBwdLPTScheduler<Varlen, kBlockN, false /*SPT*/>,
+        flash::SingleTileScheduler<Varlen, false /*Split*/, false /*PackGQA*/, kBlockN>
     >;
     using AttnKernel = flash::enable_sm90<flash::FlashAttnBwdSm90Fp8R<CollectiveMainloop, CollectiveEpilogue, Scheduler>>;
 
     typename CollectiveMainloop::Arguments mainloop_args {
         static_cast<Element const*>(params.q_ptr),
-        {seqlen_q, params.d, params.h, params.b},
-        {params.q_row_stride, _1{}, params.q_head_stride, params.q_batch_stride},
+        {seqlen_q, params.d, params.h, packed_b},
+        {params.q_row_stride, _1{}, params.q_head_stride, Varlen ? 0 : params.q_batch_stride},
         static_cast<Element const*>(params.k_ptr),
-        {seqlen_k, params.d, params.h_k, params.b},
-        {params.k_row_stride, _1{}, params.k_head_stride, params.k_batch_stride},
+        {seqlen_k, params.d, params.h_k, packed_b},
+        {params.k_row_stride, _1{}, params.k_head_stride, Varlen ? 0 : params.k_batch_stride},
         // ## bf16-dP: the dP operands are the RAW bf16 tensors at SAGEDP=1 and the e4m3 codes otherwise.
 #if FA3FP11_P1R_SAGEDP
         static_cast<typename CollectiveMainloop::ElementDp const*>(params.vraw_ptr),
-        {seqlen_k, params.dv, params.h_k, params.b},
-        {params.vraw_row_stride, _1{}, params.vraw_head_stride, params.vraw_batch_stride},
+        {seqlen_k, params.dv, params.h_k, packed_b},
+        {params.vraw_row_stride, _1{}, params.vraw_head_stride, Varlen ? 0 : params.vraw_batch_stride},
         static_cast<typename CollectiveMainloop::ElementDp const*>(params.doraw_ptr),
-        {seqlen_q, params.dv, params.h, params.b},
-        {params.doraw_row_stride, _1{}, params.doraw_head_stride, params.doraw_batch_stride},
+        {seqlen_q, params.dv, params.h, packed_b},
+        {params.doraw_row_stride, _1{}, params.doraw_head_stride, Varlen ? 0 : params.doraw_batch_stride},
 #else
         static_cast<Element const*>(params.v_ptr),
-        {seqlen_k, params.dv, params.h_k, params.b},
-        {params.v_row_stride, _1{}, params.v_head_stride, params.v_batch_stride},
+        {seqlen_k, params.dv, params.h_k, packed_b},
+        {params.v_row_stride, _1{}, params.v_head_stride, Varlen ? 0 : params.v_batch_stride},
         static_cast<Element const*>(params.do_ptr),
-        {seqlen_q, params.dv, params.h, params.b},
-        {params.do_row_stride, _1{}, params.do_head_stride, params.do_batch_stride},
+        {seqlen_q, params.dv, params.h, packed_b},
+        {params.do_row_stride, _1{}, params.do_head_stride, Varlen ? 0 : params.do_batch_stride},
 #endif
         static_cast<Element const*>(params.qt_ptr),
-        {params.d, seqlen_q, params.h, params.b},
-        {int64_t(seqlen_q), _1{}, int64_t(params.d) * seqlen_q, int64_t(params.d) * seqlen_q * params.h},
+        {params.d, seqlen_q, params.h, packed_b},
+        {int64_t(Varlen ? params.total_q : seqlen_q), _1{}, int64_t(params.d) * (Varlen ? params.total_q : seqlen_q), Varlen ? 0 : int64_t(params.d) * seqlen_q * params.h},
         static_cast<Element const*>(params.kt_ptr),
-        {params.d, seqlen_k, params.h_k, params.b},
-        {int64_t(seqlen_k), _1{}, int64_t(params.d) * seqlen_k, int64_t(params.d) * seqlen_k * params.h_k},
+        {params.d, seqlen_k, params.h_k, packed_b},
+        {int64_t(Varlen ? params.total_k : seqlen_k), _1{}, int64_t(params.d) * (Varlen ? params.total_k : seqlen_k), Varlen ? 0 : int64_t(params.d) * seqlen_k * params.h_k},
         static_cast<Element const*>(params.dot_ptr),
-        {params.dv, seqlen_q, params.h, params.b},
-        {int64_t(seqlen_q), _1{}, int64_t(params.dv) * seqlen_q, int64_t(params.dv) * seqlen_q * params.h},
+        {params.dv, seqlen_q, params.h, packed_b},
+        {int64_t(Varlen ? params.total_q : seqlen_q), _1{}, int64_t(params.dv) * (Varlen ? params.total_q : seqlen_q), Varlen ? 0 : int64_t(params.dv) * seqlen_q * params.h},
         params.q8s_ptr, params.k8s_ptr, params.v8s_ptr, params.do8s_ptr,
         params.nblk_q, params.nblk_k,
         static_cast<ElementAccum*>(params.dq_accum_ptr),
-        {seqlen_q_rounded * params.d_rounded, params.h, params.b},
-        {_1{}, seqlen_q_rounded * params.d_rounded, params.d_rounded * seqlen_q_rounded * params.h},
+        {Varlen ? seqlen_q * params.d_rounded : seqlen_q_rounded * params.d_rounded, params.h, packed_b},
+        {_1{}, Varlen ? seqlen_q * params.d_rounded : seqlen_q_rounded * params.d_rounded, Varlen ? 0 : params.d_rounded * seqlen_q_rounded * params.h},
         static_cast<float*>(params.softmax_lse_log2_ptr),
-        {seqlen_q_rounded, params.h, params.b},
-        {_1{}, seqlen_q_rounded, params.h * seqlen_q_rounded},
+        {Varlen ? seqlen_q : seqlen_q_rounded, params.h, packed_b},
+        {_1{}, Varlen ? seqlen_q : seqlen_q_rounded, Varlen ? 0 : params.h * seqlen_q_rounded},
         static_cast<float*>(params.dsoftmax_sum),
-        {_1{}, seqlen_q_rounded, params.h * seqlen_q_rounded},
+        {_1{}, Varlen ? seqlen_q : seqlen_q_rounded, Varlen ? 0 : params.h * seqlen_q_rounded},
         1.0f,
         -1, -1, 0,
         0.0f,
@@ -126,11 +127,11 @@ void run_flash_bwd_fp11r_hd128(Flash_bwd_fp8_params &params, cudaStream_t stream
     };
     typename CollectiveEpilogue::Arguments epilogue_args {
         static_cast<ElementOut*>(params.dk_ptr),
-        {seqlen_k, params.d, params.h, params.b},
-        {params.dk_row_stride, _1{}, params.dk_head_stride, params.dk_batch_stride},
+        {seqlen_k, params.d, params.h, packed_b},
+        {params.dk_row_stride, _1{}, params.dk_head_stride, Varlen ? 0 : params.dk_batch_stride},
         static_cast<ElementOut*>(params.dv_ptr),
-        {seqlen_k, params.dv, params.h, params.b},
-        {params.dv_row_stride, _1{}, params.dv_head_stride, params.dv_batch_stride},
+        {seqlen_k, params.dv, params.h, packed_b},
+        {params.dv_row_stride, _1{}, params.dv_head_stride, Varlen ? 0 : params.dv_batch_stride},
         params.b, params.h, params.dk_semaphore, params.dv_semaphore, params.cu_seqlens_k, params.seqused_k,
     };
     int num_blocks_n = cutlass::ceil_div(params.seqlen_k, get<1>(TileShape_MNK{}));
@@ -164,9 +165,9 @@ void run_flash_bwd_fp11r_hd128(Flash_bwd_fp8_params &params, cudaStream_t stream
 }
 
 
-template <bool Is_causal, int kHeadDim_>
+template <bool Is_causal, bool Varlen, int kHeadDim_>
 void run_flash_bwd_fp11_impl(Flash_bwd_fp8_params &params, cudaStream_t stream) {
-    if constexpr (kHeadDim_ < 256) { run_flash_bwd_fp11r_hd128<Is_causal>(params, stream); return; }   // ## M20 P1-R
+    if constexpr (kHeadDim_ < 256) { run_flash_bwd_fp11r_hd128<Is_causal, Varlen>(params, stream); return; }   // ## M20 P1-R
     using Element = cutlass::float_e4m3_t;
     using ElementOut = cutlass::bfloat16_t;
     using ElementAccum = float;
@@ -193,59 +194,60 @@ void run_flash_bwd_fp11_impl(Flash_bwd_fp8_params &params, cudaStream_t stream) 
     int const seqlen_q = params.seqlen_q;
     int const seqlen_k = params.seqlen_k;
     int const seqlen_q_rounded = params.seqlen_q_rounded;
+    int const packed_b = Varlen ? 1 : params.b;
 
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using TileShape_MK = cute::Shape<Int<kBlockM>, Int<kHeadDim>>;
     using ClusterShape = cute::Shape<_1, Int<1>, _1>;
     using CollectiveMainloop = flash::CollectiveMainloopBwdSm90Fp8V10<
         Stages, Stages_dO, Stages_dS, ClusterShape, TileShape_MNK, Element, ElementAccum, ArchTag,
-        Is_causal, false /*Is_local*/, false /*Has_softcap*/, false /*Varlen*/, false /*Deterministic*/,
+        Is_causal, false /*Is_local*/, false /*Has_softcap*/, Varlen, false /*Deterministic*/,
         false /*SdP_swapAB*/, true /*dKV_swapAB*/, true /*dQ_swapAB*/,
         2 /*NumMmaWarpGroups*/, 1, 1, 1, false /*V_in_regs*/>;
     using CollectiveEpilogue = flash::CollectiveEpilogueBwd<
         TileShape_MNK, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads,
-        false /*Varlen*/, true /*dKV_swapAB*/, 2 /*AtomLayoutKdKV-ish*/>;
+        Varlen, true /*dKV_swapAB*/, 2 /*AtomLayoutKdKV-ish*/>;
     using Scheduler = std::conditional_t<
         Is_causal,
-        flash::SingleTileBwdLPTScheduler<false /*Varlen*/, kBlockN, false /*SPT*/>,
-        flash::SingleTileScheduler<false /*Varlen*/, false /*Split*/, false /*PackGQA*/, kBlockN>
+        flash::SingleTileBwdLPTScheduler<Varlen, kBlockN, false /*SPT*/>,
+        flash::SingleTileScheduler<Varlen, false /*Split*/, false /*PackGQA*/, kBlockN>
     >;
     using AttnKernel = flash::enable_sm90<flash::FlashAttnBwdSm90Fp8V10<
         CollectiveMainloop, CollectiveEpilogue, Scheduler>>;
 
     typename CollectiveMainloop::Arguments mainloop_args {
         static_cast<Element const*>(params.q_ptr),
-        {seqlen_q, params.d, params.h, params.b},  // shape_Q
-        {params.q_row_stride, _1{}, params.q_head_stride, params.q_batch_stride},
+        {seqlen_q, params.d, params.h, packed_b},  // shape_Q
+        {params.q_row_stride, _1{}, params.q_head_stride, Varlen ? 0 : params.q_batch_stride},
         static_cast<Element const*>(params.k_ptr),
-        {seqlen_k, params.d, params.h_k, params.b},  // shape_K
-        {params.k_row_stride, _1{}, params.k_head_stride, params.k_batch_stride},
+        {seqlen_k, params.d, params.h_k, packed_b},  // shape_K
+        {params.k_row_stride, _1{}, params.k_head_stride, Varlen ? 0 : params.k_batch_stride},
         static_cast<Element const*>(params.v_ptr),
-        {seqlen_k, params.dv, params.h_k, params.b},  // shape_V
-        {params.v_row_stride, _1{}, params.v_head_stride, params.v_batch_stride},
+        {seqlen_k, params.dv, params.h_k, packed_b},  // shape_V
+        {params.v_row_stride, _1{}, params.v_head_stride, Varlen ? 0 : params.v_batch_stride},
         static_cast<Element const*>(params.do_ptr),
-        {seqlen_q, params.dv, params.h, params.b},  // shape_dO
-        {params.do_row_stride, _1{}, params.do_head_stride, params.do_batch_stride},
+        {seqlen_q, params.dv, params.h, packed_b},  // shape_dO
+        {params.do_row_stride, _1{}, params.do_head_stride, Varlen ? 0 : params.do_batch_stride},
         // ## FQ8 twins: [d, seq, head, batch], seq-contiguous ([BH, D, N] tensors).
         static_cast<Element const*>(params.qt_ptr),
-        {params.d, seqlen_q, params.h, params.b},   // shape_Qt
-        {int64_t(seqlen_q), _1{}, int64_t(params.d) * seqlen_q, int64_t(params.d) * seqlen_q * params.h},
+        {params.d, seqlen_q, params.h, packed_b},   // shape_Qt
+        {int64_t(seqlen_q), _1{}, int64_t(params.d) * seqlen_q, Varlen ? 0 : int64_t(params.d) * seqlen_q * params.h},
         static_cast<Element const*>(params.kt_ptr),
-        {params.d, seqlen_k, params.h_k, params.b},  // shape_Kt
-        {int64_t(seqlen_k), _1{}, int64_t(params.d) * seqlen_k, int64_t(params.d) * seqlen_k * params.h_k},
+        {params.d, seqlen_k, params.h_k, packed_b},  // shape_Kt
+        {int64_t(seqlen_k), _1{}, int64_t(params.d) * seqlen_k, Varlen ? 0 : int64_t(params.d) * seqlen_k * params.h_k},
         static_cast<Element const*>(params.dot_ptr),
-        {params.dv, seqlen_q, params.h, params.b},  // shape_dOt
-        {int64_t(seqlen_q), _1{}, int64_t(params.dv) * seqlen_q, int64_t(params.dv) * seqlen_q * params.h},
+        {params.dv, seqlen_q, params.h, packed_b},  // shape_dOt
+        {int64_t(seqlen_q), _1{}, int64_t(params.dv) * seqlen_q, Varlen ? 0 : int64_t(params.dv) * seqlen_q * params.h},
         params.q8s_ptr, params.k8s_ptr, params.v8s_ptr, params.do8s_ptr,
         params.nblk_q, params.nblk_k,
         static_cast<ElementAccum*>(params.dq_accum_ptr),
-        {seqlen_q_rounded * params.d_rounded, params.h, params.b},  // shape_dQaccum
-        {_1{}, seqlen_q_rounded * params.d_rounded, params.d_rounded * seqlen_q_rounded * params.h},
+        {Varlen ? seqlen_q * params.d_rounded : seqlen_q_rounded * params.d_rounded, params.h, packed_b},  // shape_dQaccum
+        {_1{}, Varlen ? seqlen_q * params.d_rounded : seqlen_q_rounded * params.d_rounded, Varlen ? 0 : params.d_rounded * seqlen_q_rounded * params.h},
         static_cast<float*>(params.softmax_lse_log2_ptr),
-        {seqlen_q_rounded, params.h, params.b},  // shape_LSE
-        {_1{}, seqlen_q_rounded, params.h * seqlen_q_rounded},  // stride_LSE_log2
+        {Varlen ? seqlen_q : seqlen_q_rounded, params.h, packed_b},  // shape_LSE
+        {_1{}, Varlen ? seqlen_q : seqlen_q_rounded, Varlen ? 0 : params.h * seqlen_q_rounded},  // stride_LSE_log2
         static_cast<float*>(params.dsoftmax_sum),
-        {_1{}, seqlen_q_rounded, params.h * seqlen_q_rounded},  // stride_dPsum
+        {_1{}, Varlen ? seqlen_q : seqlen_q_rounded, Varlen ? 0 : params.h * seqlen_q_rounded},  // stride_dPsum
         1.0f,  // ## FQ8: softmax_scale=1 in the mainloop (sm is baked into the Q
                // codes; dQ's explicit sm factor rides in the postprocess).
         -1, -1, 0,  // window_size_left/right, attention_chunk
@@ -261,11 +263,11 @@ void run_flash_bwd_fp11_impl(Flash_bwd_fp8_params &params, cudaStream_t stream) 
     };
     typename CollectiveEpilogue::Arguments epilogue_args {
         static_cast<ElementOut*>(params.dk_ptr),
-        {seqlen_k, params.d, params.h, params.b},  // shape_dK
-        {params.dk_row_stride, _1{}, params.dk_head_stride, params.dk_batch_stride},
+        {seqlen_k, params.d, params.h, packed_b},  // shape_dK
+        {params.dk_row_stride, _1{}, params.dk_head_stride, Varlen ? 0 : params.dk_batch_stride},
         static_cast<ElementOut*>(params.dv_ptr),
-        {seqlen_k, params.dv, params.h, params.b},
-        {params.dv_row_stride, _1{}, params.dv_head_stride, params.dv_batch_stride},
+        {seqlen_k, params.dv, params.h, packed_b},
+        {params.dv_row_stride, _1{}, params.dv_head_stride, Varlen ? 0 : params.dv_batch_stride},
         params.b,
         params.h,
         params.dk_semaphore,
@@ -317,11 +319,24 @@ void run_flash_bwd_fp11_impl(Flash_bwd_fp8_params &params, cudaStream_t stream) 
 
 template <bool Is_causal>
 void run_flash_bwd_fp11_d256(Flash_bwd_fp8_params &params, cudaStream_t stream) {
-    run_flash_bwd_fp11_impl<Is_causal, 256>(params, stream);
+    run_flash_bwd_fp11_impl<Is_causal, false, 256>(params, stream);
 }
 
 // ## Delta-Matching-128
 template <bool Is_causal>
 void run_flash_bwd_fp11_d128(Flash_bwd_fp8_params &params, cudaStream_t stream) {
-    run_flash_bwd_fp11_impl<Is_causal, 128>(params, stream);
+    run_flash_bwd_fp11_impl<Is_causal, false, 128>(params, stream);
+}
+
+// Packed-varlen backward instantiations.  The host API supplies regular
+// per-sequence workspace when max lengths differ and compacts gradients after
+// pass 2.
+template <bool Is_causal>
+void run_flash_bwd_fp11_varlen_d256(Flash_bwd_fp8_params &params, cudaStream_t stream) {
+    run_flash_bwd_fp11_impl<Is_causal, true, 256>(params, stream);
+}
+
+template <bool Is_causal>
+void run_flash_bwd_fp11_varlen_d128(Flash_bwd_fp8_params &params, cudaStream_t stream) {
+    run_flash_bwd_fp11_impl<Is_causal, true, 128>(params, stream);
 }

@@ -176,6 +176,12 @@ struct P2Params {
     // ## FP11-M16 (native GQA, READ side): the Kt twin is per KV head
     // [b, h_k, d, s]; h_k == h reproduces the M10 index arithmetic exactly.
     int h_k;
+    // Packed varlen metadata. Null in the fixed-shape path.
+    int const* cu_seqlens_q;
+    int const* cu_seqlens_k;
+    int const* seqused_q;
+    int const* seqused_k;
+    bool varlen;
 };
 
 template <bool Is_causal>
@@ -183,9 +189,25 @@ __global__ void __launch_bounds__(128, 1)
 fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
     extern __shared__ char smem_raw[];
     auto& shared = *reinterpret_cast<SharedStorage*>(smem_raw);
-    int const mb = params.nbm - 1 - blockIdx.x;   // longest-first
     int const bh = blockIdx.y;
-    int const nb_end = Is_causal ? (mb + 1) : params.nbn;
+    int const b_idx = bh / params.h;
+    int const q_start = params.varlen ? params.cu_seqlens_q[b_idx] : 0;
+    int const k_start = params.varlen ? params.cu_seqlens_k[b_idx] : 0;
+    int const q_len = params.varlen
+        ? (params.seqused_q ? params.seqused_q[b_idx] : params.cu_seqlens_q[b_idx + 1] - q_start)
+        : params.nbm * kBM;
+    int const k_len = params.varlen
+        ? (params.seqused_k ? params.seqused_k[b_idx] : params.cu_seqlens_k[b_idx + 1] - k_start)
+        : params.nbn * kBK;
+    int const nbm = (q_len + kBM - 1) / kBM;
+    int const nbn = (k_len + kBK - 1) / kBK;
+    if (blockIdx.x >= nbm) return;
+    int const mb = nbm - 1 - blockIdx.x;   // longest-first
+    int const q_block = nbm - 1 - mb;
+    int const causal_shift = k_len - q_len;
+    int const nb_end = Is_causal
+        ? min((q_block * kBM + kBM + causal_shift + kBK - 1) / kBK, nbn)
+        : nbn;
     int const tid = threadIdx.x;
 
     if (tid == 0) {
@@ -201,8 +223,10 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
     Tensor mB = params.tma_b.get_tma_tensor(params.shape_b);
     Tensor gA = mA(_, _, _, mb, bh);                                    // (64, 64, nbn)
     // ## FP11-M16 (native GQA): B operand indexed by KV head.
-    int const bh_kv = (bh / params.h) * params.h_k + (bh % params.h) / (params.h / params.h_k);
-    Tensor gB = flat_divide(mB(_, _, bh_kv), Shape<Int<kBD>, Int<kBK>>{})(_, _, _0{}, _);  // (256, 64, nbn)
+    int const bh_kv = (params.varlen ? 0 : (bh / params.h) * params.h_k)
+                    + (bh % params.h) / (params.h / params.h_k);
+    Tensor gB_base = domain_offset(make_coord(_0{}, k_start, _0{}), mB);
+    Tensor gB = flat_divide(gB_base(_, _, bh_kv), Shape<Int<kBD>, Int<kBK>>{})(_, _, _0{}, _);  // (256, 64, nbn)
     auto blkA = params.tma_a.get_slice(_0{});
     auto blkB = params.tma_b.get_slice(_0{});
     Tensor tAgA = group_modes<0, 3>(blkA.partition_S(gA));              // (TMA, nbn)
@@ -353,10 +377,11 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
     // window); apply final_scale = sm/256 ONLY.  A row whose every tile was
     // a sentinel/skip leaves smem_dq at its zero-init: dq is exactly zero.
     float const fin = params.final_scale;
-    int const b_idx = bh / params.h;
     int const h_idx = bh % params.h;
     auto* dq_base = reinterpret_cast<cutlass::bfloat16_t*>(params.dq_ptr)
-        + int64_t(b_idx) * params.dq_batch_stride + int64_t(h_idx) * params.dq_head_stride
+        + (params.varlen ? int64_t(q_start) * params.dq_row_stride
+                         : int64_t(b_idx) * params.dq_batch_stride)
+        + int64_t(h_idx) * params.dq_head_stride
         + int64_t(mb) * kBM * params.dq_row_stride;
     // wgmma C fragment: even/odd i are column-adjacent -> packed u32 stores.
     #pragma unroll
@@ -390,16 +415,23 @@ void run_fq8_dq_pass2_fp11(Flash_bwd_fp8_params &params, cudaStream_t stream) {
     Tensor mA = make_tensor(make_gmem_ptr(static_cast<Element const*>(params.ds8_ptr)),
                             shape_a, stride_a);
     TmaA tma_a = make_tma_copy(cute::SM90_TMA_LOAD{}, mA, SmemLayoutA{}(_, _, _0{}));
-    ShapeB shape_b = make_shape(Int<kBD>{}, params.seqlen_k, params.b * params.h_k);   // ## FP11-M16: per KV head
-    StrideB stride_b = make_stride(int64_t(params.seqlen_k), _1{},
-                                   int64_t(kBD) * params.seqlen_k);
+    // The descriptor extent is the per-sequence maximum.  Packed storage can
+    // be larger, so keep its physical stride separate from the logical extent.
+    int const packed_k = params.seqlen_k;
+    int const packed_hk = params.varlen ? params.h_k : params.b * params.h_k;
+    ShapeB shape_b = make_shape(Int<kBD>{}, packed_k, packed_hk);   // ## FP11-M16: per KV head
+    int const physical_k = params.varlen ? params.total_k : params.seqlen_k;
+    StrideB stride_b = make_stride(int64_t(physical_k), _1{},
+                                   int64_t(kBD) * physical_k);
     Tensor mB = make_tensor(make_gmem_ptr(static_cast<Element const*>(params.kt_ptr)),
                             shape_b, stride_b);
     TmaB tma_b = make_tma_copy(cute::SM90_TMA_LOAD{}, mB, SmemLayoutB{}(_, _, _0{}));
     P2Params p2{tma_a, tma_b, shape_a, shape_b, params.psi_ptr,
                 params.dq_ptr, params.dq_row_stride, params.dq_head_stride,
                 params.dq_batch_stride,
-                params.scale_softmax / 256.0f, nbm, nbn, params.h, params.h_k};
+                params.scale_softmax / 256.0f, nbm, nbn, params.h, params.h_k,
+                params.cu_seqlens_q, params.cu_seqlens_k,
+                params.seqused_q, params.seqused_k, params.varlen};
     auto* kernel = &fq8p2::fq8_dq_pass2_kernel<Is_causal>;
     constexpr int kSmem = int(sizeof(SharedStorage));
     if (kSmem >= 48 * 1024) {

@@ -5,3 +5,5 @@
 
 template void run_flash_bwd_fp11_d128<true>(Flash_bwd_fp8_params &params, cudaStream_t stream);
 template void run_flash_bwd_fp11_d128<false>(Flash_bwd_fp8_params &params, cudaStream_t stream);
+template void run_flash_bwd_fp11_varlen_d128<true>(Flash_bwd_fp8_params &params, cudaStream_t stream);
+template void run_flash_bwd_fp11_varlen_d128<false>(Flash_bwd_fp8_params &params, cudaStream_t stream);

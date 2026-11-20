@@ -19,6 +19,8 @@
 #include <c10/cuda/CUDAException.h>
 #include <cstdint>
 #include <cmath>
+#include <limits>
+#include <vector>
 
 #include "flash_bwd_fp8_params.h"   // Flash_fwd_fp8_params / Flash_bwd_fp8_params (pulls flash.h)
 // ## bf16-dP: the build (_buildcfg.py) passes -DFA3FP11_P1R_SAGEDP to every TU; this keeps the host TU compilable alone.
@@ -46,7 +48,11 @@ PyObject* PyInit__C(void)
 template <bool Is_causal>
 void run_flash_fwd_fp8f_d256(Flash_fwd_fp8_params &params, cudaStream_t stream);
 template <bool Is_causal>
+void run_flash_fwd_fp8f_varlen_d256(Flash_fwd_fp8_params &params, cudaStream_t stream);
+template <bool Is_causal>
 void run_flash_bwd_fp11_d256(Flash_bwd_fp8_params &params, cudaStream_t stream);
+template <bool Is_causal>
+void run_flash_bwd_fp11_varlen_d256(Flash_bwd_fp8_params &params, cudaStream_t stream);
 template <bool Is_causal>
 void run_flash_delta_fp11_d256(Flash_bwd_fp8_params &params, cudaStream_t stream);
 // ## Delta-Matching-128 (M19): the head_dim 128 instantiations (compiled when FA3FP11_HD128=1;
@@ -54,7 +60,11 @@ void run_flash_delta_fp11_d256(Flash_bwd_fp8_params &params, cudaStream_t stream
 template <bool Is_causal>
 void run_flash_fwd_fp8f_d128(Flash_fwd_fp8_params &params, cudaStream_t stream);
 template <bool Is_causal>
+void run_flash_fwd_fp8f_varlen_d128(Flash_fwd_fp8_params &params, cudaStream_t stream);
+template <bool Is_causal>
 void run_flash_bwd_fp11_d128(Flash_bwd_fp8_params &params, cudaStream_t stream);
+template <bool Is_causal>
+void run_flash_bwd_fp11_varlen_d128(Flash_bwd_fp8_params &params, cudaStream_t stream);
 template <bool Is_causal>
 void run_flash_delta_fp11_d128(Flash_bwd_fp8_params &params, cudaStream_t stream);
 // The block-scale contract per head dim (blocks()): Q/dO rows per scale, K/V keys per scale, pass-1 kBlockN.
@@ -89,6 +99,16 @@ void dm_check_codes(char const* op, std::initializer_list<at::Tensor> ts) {
         for (int i = 0; i < 3; ++i) {
             TORCH_CHECK(t.stride(i) % 16 == 0, "delta_matching ", op, ": code strides must be 16-byte multiples (dim ", i, ")");
         }
+    }
+}
+void dm_check_codes_varlen(char const* op, std::initializer_list<at::Tensor> ts) {
+    for (auto const& t : ts) {
+        if (!t.defined()) { continue; }
+        TORCH_CHECK(t.dim() == 3 && t.scalar_type() == at::kFloat8_e4m3fn,
+                    "delta_matching ", op, ": packed codes must be 3-D e4m3 tensors");
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
+                    "delta_matching ", op, ": packed codes must be 16-byte aligned");
+        TORCH_CHECK(t.stride(-1) == 1, "delta_matching ", op, ": packed code last stride must be 1");
     }
 }
 void dm_check_scales(char const* op, std::initializer_list<at::Tensor> ts) {
@@ -202,6 +222,168 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8(
     double softmax_scale, bool is_causal
 ) {
     return fwd_fp8_core(q8, k8, v8, q8s, k8s, v8s, softmax_scale, is_causal);
+}
+
+// Packed varlen forward.  Codes use [total_tokens, heads, d] and scales use
+// [batch, heads, max_num_blocks].  The FA3 Varlen scheduler obtains each
+// sequence's offsets from cu_seqlens and indexes the packed token storage with
+// a zero batch stride.
+std::tuple<at::Tensor, at::Tensor> fwd_fp8_varlen(
+    at::Tensor q8, at::Tensor k8, at::Tensor v8,
+    at::Tensor q8s, at::Tensor k8s, at::Tensor v8s,
+    at::Tensor cu_seqlens_q, at::Tensor cu_seqlens_k,
+    int64_t max_seqlen_q, int64_t max_seqlen_k,
+    double softmax_scale, bool is_causal
+) {
+    c10::cuda::CUDAGuard device_guard(q8.device());
+    dm_check_inputs("fwd_varlen", q8, {k8, v8, q8s, k8s, v8s, cu_seqlens_q, cu_seqlens_k});
+    dm_check_codes_varlen("fwd_varlen", {q8, k8, v8});
+    dm_check_scales("fwd_varlen", {q8s, k8s, v8s});
+    TORCH_CHECK(cu_seqlens_q.dim() == 1 && cu_seqlens_k.dim() == 1,
+                "delta_matching fwd_varlen: cu_seqlens must be 1-D");
+    TORCH_CHECK(cu_seqlens_q.scalar_type() == at::kInt && cu_seqlens_k.scalar_type() == at::kInt,
+                "delta_matching fwd_varlen: cu_seqlens must be int32");
+    TORCH_CHECK(cu_seqlens_q.is_contiguous() && cu_seqlens_k.is_contiguous(),
+                "delta_matching fwd_varlen: cu_seqlens must be contiguous");
+    int const b = int(cu_seqlens_q.numel()) - 1;
+    TORCH_CHECK(b > 0 && cu_seqlens_k.numel() == cu_seqlens_q.numel(),
+                "delta_matching fwd_varlen: cu_seqlens must have matching non-empty batch");
+    TORCH_CHECK(max_seqlen_q > 0 && max_seqlen_k > 0,
+                "delta_matching fwd_varlen: max_seqlen values must be positive");
+    TORCH_CHECK(q8.dim() == 3 && k8.dim() == 3 && v8.dim() == 3,
+                "delta_matching fwd_varlen: q/k/v must be packed [total, heads, d]");
+    int const h = q8.size(1), hk = k8.size(1), d = q8.size(2);
+    TORCH_CHECK(k8.sizes() == v8.sizes() && q8.size(2) == k8.size(2),
+                "delta_matching fwd_varlen: k and v must have matching packed shapes");
+    TORCH_CHECK(h > 0 && hk > 0 && h % hk == 0 && d > 0,
+                "delta_matching fwd_varlen: invalid head counts or head_dim");
+    TORCH_CHECK(q8.size(0) == cu_seqlens_q[-1].item<int>() &&
+                k8.size(0) == cu_seqlens_k[-1].item<int>(),
+                "delta_matching fwd_varlen: packed token count must equal cu_seqlens[-1]");
+    TORCH_CHECK(q8s.dim() == 3 && k8s.dim() == 3 && v8s.dim() == 3 &&
+                q8s.size(0) == b && k8s.size(0) == b && v8s.size(0) == b &&
+                q8s.size(1) == h && k8s.size(1) == hk && v8s.size(1) == hk,
+                "delta_matching fwd_varlen: scales must be [batch, heads, max_num_blocks]");
+    TORCH_CHECK(q8s.is_contiguous() && k8s.is_contiguous() && v8s.is_contiguous(),
+                "delta_matching fwd_varlen: scales must be contiguous");
+    TORCH_CHECK(cu_seqlens_q[-1].item<int>() <= INT32_MAX && cu_seqlens_k[-1].item<int>() <= INT32_MAX,
+                "delta_matching fwd_varlen: packed token count exceeds int32");
+    TORCH_CHECK(fp11_hd_supported(d), "delta_matching fwd_varlen: head_dim must be 256 (or 128 in a Delta-Matching-128 build)");
+    int const rq = fp11_quant_rows_q(d), rk = fp11_quant_keys(d);
+    TORCH_CHECK(max_seqlen_q % rq == 0 && max_seqlen_k % rk == 0,
+                "delta_matching fwd_varlen: max lengths must align to the FP8 scale blocks");
+    if (d == 128) {
+        TORCH_CHECK(max_seqlen_k % 256 == 0,
+                    "delta_matching fwd_varlen (Delta-Matching-128): max_seqlen_k must be a 256-multiple");
+    }
+    TORCH_CHECK(q8s.size(2) >= max_seqlen_q / rq &&
+                k8s.size(2) >= max_seqlen_k / rk && v8s.size(2) >= max_seqlen_k / rk,
+                "delta_matching fwd_varlen: scale tensors are too short for max lengths");
+    auto opts = q8.options();
+    // TMA descriptors reject zero global extents.  Match FA3's host-side
+    // early exits before constructing any descriptor when one packed side is
+    // empty.  A zero-key batch has zero attention mass and therefore emits
+    // zero output with -inf LSE.
+    if (q8.size(0) == 0) {
+        return {torch::empty({0, h, d}, opts.dtype(at::kBFloat16)),
+                torch::empty({0, h}, opts.dtype(at::kFloat))};
+    }
+    if (k8.size(0) == 0) {
+        auto empty_o = torch::zeros({q8.size(0), h, d}, opts.dtype(at::kBFloat16));
+        auto empty_lse = torch::full({q8.size(0), h}, -std::numeric_limits<float>::infinity(), opts.dtype(at::kFloat));
+        return {empty_o, empty_lse};
+    }
+    bool const needs_padding = (q8.size(0) != b * int(max_seqlen_q)) ||
+                               (k8.size(0) != b * int(max_seqlen_k));
+    at::Tensor q_work = q8, k_work = k8, v_work = v8;
+    at::Tensor cu_work = cu_seqlens_q, cu_k_work = cu_seqlens_k, used_q, used_k;
+    int work_q = q8.size(0), work_k = k8.size(0);
+    if (needs_padding) {
+        std::vector<int> hq(b + 1), hkoff(b + 1), husedq(b), husedk(b);
+        for (int i = 0; i <= b; ++i) {
+            hq[i] = i * int(max_seqlen_q);
+            hkoff[i] = i * int(max_seqlen_k);
+        }
+        for (int i = 0; i < b; ++i) {
+            husedq[i] = cu_seqlens_q[i + 1].item<int>() - cu_seqlens_q[i].item<int>();
+            husedk[i] = cu_seqlens_k[i + 1].item<int>() - cu_seqlens_k[i].item<int>();
+        }
+        auto iopts = cu_seqlens_q.options();
+        cu_work = torch::tensor(hq, iopts);
+        cu_k_work = torch::tensor(hkoff, iopts);
+        used_q = torch::tensor(husedq, iopts);
+        used_k = torch::tensor(husedk, iopts);
+        work_q = b * int(max_seqlen_q);
+        work_k = b * int(max_seqlen_k);
+        q_work = torch::zeros({work_q, h, d}, opts);
+        k_work = torch::zeros({work_k, hk, d}, opts);
+        v_work = torch::zeros({work_k, hk, d}, opts);
+        for (int i = 0; i < b; ++i) {
+            int const qs = cu_seqlens_q[i].item<int>();
+            int const ks = cu_seqlens_k[i].item<int>();
+            int const qn = husedq[i];
+            int const kn = husedk[i];
+            q_work.narrow(0, hq[i], qn).copy_(q8.narrow(0, qs, qn));
+            k_work.narrow(0, hkoff[i], kn).copy_(k8.narrow(0, ks, kn));
+            v_work.narrow(0, hkoff[i], kn).copy_(v8.narrow(0, ks, kn));
+        }
+    }
+    auto o = torch::empty({work_q, h, d}, opts.dtype(at::kBFloat16));
+    // FA3's kernels keep LSE in a padded [batch, head, max_seqlen] view even
+    // for packed inputs.  Materialize the public packed [total_q, head]
+    // result after the launch below.
+    auto lse_packed_storage = torch::empty({h, work_q}, opts.dtype(at::kFloat));
+    int const b_rounded = (b + 3) / 4 * 4;
+    int const metadata_vectors = 4;  // splits, m-blocks, sorted batch ids, head-swizzle counts
+    int const metadata_offset = b_rounded * metadata_vectors;
+    auto sem = torch::zeros({metadata_offset + 1}, opts.dtype(at::kInt));
+    Flash_fwd_fp8_params p{};
+    p.b = b; p.h = h; p.h_k = hk;
+    p.seqlen_q = int(max_seqlen_q); p.seqlen_k = int(max_seqlen_k);
+    p.seqlen_q_rounded = p.seqlen_q; p.seqlen_k_rounded = p.seqlen_k;
+    p.total_q = work_q; p.total_k = work_k;
+    p.d = d; p.dv = d; p.d_rounded = d; p.dv_rounded = d;
+    p.scale_softmax = 1.0f; p.is_causal = is_causal; p.is_bf16 = true;
+    p.varlen_sort_batches = std::getenv("DM_VARLEN_NO_SORT") == nullptr;
+    p.head_swizzle = is_causal && std::getenv("DM_VARLEN_NO_SWIZZLE") == nullptr;
+    p.prepare_varlen_pdl = true;
+    p.q_ptr = q_work.data_ptr(); p.k_ptr = k_work.data_ptr(); p.v_ptr = v_work.data_ptr();
+    p.q_row_stride = q_work.stride(0); p.q_head_stride = q_work.stride(1); p.q_batch_stride = 0;
+    p.k_row_stride = k_work.stride(0); p.k_head_stride = k_work.stride(1); p.k_batch_stride = 0;
+    p.v_row_stride = v_work.stride(0); p.v_head_stride = v_work.stride(1); p.v_batch_stride = 0; p.v_dim_stride = v_work.stride(2);
+    p.o_ptr = o.data_ptr(); p.o_row_stride = o.stride(0); p.o_head_stride = o.stride(1); p.o_batch_stride = 0;
+    p.softmax_lse_ptr = lse_packed_storage.data_ptr();
+    int* metadata = sem.data_ptr<int>();
+    p.num_splits_dynamic_ptr = metadata;
+    p.num_m_blocks_ptr = metadata + b_rounded;
+    p.varlen_batch_idx_ptr = metadata + 2 * b_rounded;
+    p.num_nheads_in_l2_ptr = metadata + 3 * b_rounded;
+    p.tile_count_semaphore = metadata + metadata_offset;
+    p.cu_seqlens_q = cu_work.data_ptr<int>(); p.cu_seqlens_k = cu_k_work.data_ptr<int>();
+    p.seqused_q = needs_padding ? used_q.data_ptr<int>() : nullptr;
+    p.seqused_k = needs_padding ? used_k.data_ptr<int>() : nullptr;
+    p.q8s_ptr = q8s.data_ptr<float>(); p.k8s_ptr = k8s.data_ptr<float>(); p.v8s_ptr = v8s.data_ptr<float>();
+    p.nblk_q = int(q8s.size(2)); p.nblk_k = int(k8s.size(2)); p.num_sm = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    p.arch = 90; p.num_splits = 1; p.window_size_left = -1; p.window_size_right = -1;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    if (d == 128) {
+        if (is_causal) run_flash_fwd_fp8f_varlen_d128<true>(p, stream);
+        else run_flash_fwd_fp8f_varlen_d128<false>(p, stream);
+    } else {
+        if (is_causal) run_flash_fwd_fp8f_varlen_d256<true>(p, stream);
+        else run_flash_fwd_fp8f_varlen_d256<false>(p, stream);
+    }
+    auto lse = lse_packed_storage.transpose(0, 1).contiguous();
+    if (!needs_padding) return {o, lse};
+    auto o_out = torch::empty({q8.size(0), h, d}, opts.dtype(at::kBFloat16));
+    auto lse_out = torch::empty({q8.size(0), h}, opts.dtype(at::kFloat));
+    for (int i = 0; i < b; ++i) {
+        int const qs = cu_seqlens_q[i].item<int>();
+        int const qn = used_q[i].item<int>();
+        o_out.narrow(0, qs, qn).copy_(o.narrow(0, i * int(max_seqlen_q), qn));
+        lse_out.narrow(0, qs, qn).copy_(lse.narrow(0, i * int(max_seqlen_q), qn));
+    }
+    return {o_out, lse_out};
 }
 
 // ## FQ8-V10 (SPLIT): the 7/7-fp8 d256 backward.  Pass 1 (column-parallel):
@@ -434,6 +616,132 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_t(
     return bwd_fp8_core(dout8, q8, k8, v8, lse, delta, kt8, qt8, dot8, q8s, k8s, v8s,
                         do8s, softmax_scale, is_causal,
                         nullptr, nullptr, nullptr);
+}
+
+// Native packed-varlen backward.  The host side uses a regular per-sequence
+// workspace when max lengths differ, while the CUDA pass remains a single
+// Varlen launch and compacts gradients back to the caller's packed layout.
+std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_varlen(
+    at::Tensor dout8, at::Tensor q8, at::Tensor k8, at::Tensor v8,
+    at::Tensor lse, at::Tensor delta, at::Tensor kt8,
+    at::Tensor qt8, at::Tensor dot8, at::Tensor q8s, at::Tensor k8s,
+    at::Tensor v8s, at::Tensor do8s, at::Tensor cu_seqlens_q,
+    at::Tensor cu_seqlens_k, int64_t max_seqlen_q, int64_t max_seqlen_k,
+    double softmax_scale, bool is_causal
+) {
+    c10::cuda::CUDAGuard guard(q8.device());
+    TORCH_CHECK(cu_seqlens_q.is_cuda() && cu_seqlens_k.is_cuda() && cu_seqlens_q.scalar_type() == at::kInt && cu_seqlens_k.scalar_type() == at::kInt);
+    TORCH_CHECK(cu_seqlens_q.dim() == 1 && cu_seqlens_k.dim() == 1 && cu_seqlens_q.numel() == cu_seqlens_k.numel() && cu_seqlens_q.numel() >= 2);
+    int const b = cu_seqlens_q.numel() - 1;
+    int const total_q = q8.size(0), total_k = k8.size(0);
+    TORCH_CHECK(cu_seqlens_q[-1].item<int>() == total_q && cu_seqlens_k[-1].item<int>() == total_k);
+    int const h = q8.size(1), hk = k8.size(1), d = q8.size(2);
+    dm_check_inputs("bwd_varlen", q8, {dout8, k8, v8, lse, delta, kt8, qt8, dot8,
+                                       q8s, k8s, v8s, do8s, cu_seqlens_q, cu_seqlens_k});
+    dm_check_codes_varlen("bwd_varlen", {dout8, q8, k8, v8, kt8, qt8, dot8});
+    dm_check_scales("bwd_varlen", {q8s, k8s, v8s, do8s});
+    TORCH_CHECK(q8.dim() == 3 && k8.dim() == 3 && v8.dim() == 3 && dout8.sizes() == q8.sizes(),
+                "delta_matching bwd_varlen: codes must be packed [total, heads, d]");
+    TORCH_CHECK(q8.is_contiguous() && k8.is_contiguous() && v8.is_contiguous() && dout8.is_contiguous(),
+                "delta_matching bwd_varlen: packed codes must be contiguous");
+    TORCH_CHECK(lse.is_contiguous() && delta.is_contiguous() && kt8.is_contiguous()
+                && qt8.is_contiguous() && dot8.is_contiguous(),
+                "delta_matching bwd_varlen: lse, delta and twins must be contiguous");
+    TORCH_CHECK(qt8.sizes() == torch::IntArrayRef({h, d, total_q})
+                && dot8.sizes() == qt8.sizes()
+                && kt8.sizes() == torch::IntArrayRef({hk, d, total_k}),
+                "delta_matching bwd_varlen: twin shapes are incompatible with packed codes");
+    TORCH_CHECK(d == 256 || (d == 128 && FA3FP11_HD128), "unsupported head dimension");
+    TORCH_CHECK(dout8.sizes() == q8.sizes() && v8.size(1) == hk && k8.size(2) == d && v8.size(2) == d);
+    TORCH_CHECK(lse.sizes() == torch::IntArrayRef({total_q, h}) && delta.sizes() == lse.sizes());
+    TORCH_CHECK(q8s.size(0) == b && k8s.size(0) == b && v8s.size(0) == b && do8s.size(0) == b);
+    TORCH_CHECK(q8s.size(1) == h && do8s.size(1) == h && k8s.size(1) == hk && v8s.size(1) == hk);
+    TORCH_CHECK(h % hk == 0 && max_seqlen_q > 0 && max_seqlen_k > 0);
+    TORCH_CHECK(q8s.is_contiguous() && k8s.is_contiguous() && v8s.is_contiguous() && do8s.is_contiguous(),
+                "delta_matching bwd_varlen: scales must be contiguous");
+    int const kbn = fp11_bwd_block_n(d), rq = fp11_quant_rows_q(d), rk = fp11_quant_keys(d);
+    if (total_q == 0 || total_k == 0) {
+        auto zq = torch::zeros({total_q, h, d}, q8.options().dtype(at::kBFloat16));
+        auto zk = torch::zeros({total_k, hk, d}, q8.options().dtype(at::kBFloat16));
+        auto zv = torch::zeros({total_k, hk, d}, q8.options().dtype(at::kBFloat16));
+        return {zq, zk, zv};
+    }
+    TORCH_CHECK(max_seqlen_q % 64 == 0 && max_seqlen_k % kbn == 0);
+    int const nbm = max_seqlen_q / 64, nbn = max_seqlen_k / kbn;
+    auto opts = q8.options();
+    // TMA descriptors require a regular per-batch extent.  Repack unequal
+    // packed sequences into a B*max-length workspace while retaining the
+    // original lengths in seqused_{q,k}.  The kernel still runs once over all
+    // sequences and pass 2 compacts its results below.
+    bool const needs_padding = (total_q != b * int(max_seqlen_q)) || (total_k != b * int(max_seqlen_k));
+    at::Tensor q_work = q8, k_work = k8, v_work = v8, do_work = dout8;
+    at::Tensor qt_work = qt8, kt_work = kt8, dot_work = dot8;
+    at::Tensor lse_work = lse.transpose(0, 1).contiguous();
+    at::Tensor delta_work = delta.transpose(0, 1).contiguous();
+    at::Tensor cu_work = cu_seqlens_q, cu_k_work = cu_seqlens_k, used_q, used_k;
+    int work_q = total_q, work_k = total_k;
+    if (needs_padding) {
+        std::vector<int> hq(b + 1), hkoff(b + 1), husedq(b), husedk(b);
+        for (int i = 0; i <= b; ++i) { hq[i] = i * int(max_seqlen_q); hkoff[i] = i * int(max_seqlen_k); }
+        for (int i = 0; i < b; ++i) {
+            husedq[i] = cu_seqlens_q[i + 1].item<int>() - cu_seqlens_q[i].item<int>();
+            husedk[i] = cu_seqlens_k[i + 1].item<int>() - cu_seqlens_k[i].item<int>();
+        }
+        auto iopts = cu_seqlens_q.options();
+        cu_work = torch::tensor(hq, iopts); cu_k_work = torch::tensor(hkoff, iopts);
+        used_q = torch::tensor(husedq, iopts); used_k = torch::tensor(husedk, iopts);
+        work_q = b * int(max_seqlen_q); work_k = b * int(max_seqlen_k);
+        q_work = torch::zeros({work_q, h, d}, opts); k_work = torch::zeros({work_k, hk, d}, opts);
+        v_work = torch::zeros({work_k, hk, d}, opts); do_work = torch::zeros({work_q, h, d}, opts);
+        qt_work = torch::zeros({h, d, work_q}, opts); dot_work = torch::zeros({h, d, work_q}, opts);
+        kt_work = torch::zeros({hk, d, work_k}, opts);
+        lse_work = torch::zeros({h, work_q}, opts.dtype(at::kFloat)); delta_work = torch::zeros({h, work_q}, opts.dtype(at::kFloat));
+        for (int i = 0; i < b; ++i) {
+            int qs = cu_seqlens_q[i].item<int>(), ks = cu_seqlens_k[i].item<int>();
+            int qn = husedq[i], kn = husedk[i];
+            q_work.narrow(0, hq[i], qn).copy_(q8.narrow(0, qs, qn)); do_work.narrow(0, hq[i], qn).copy_(dout8.narrow(0, qs, qn));
+            k_work.narrow(0, hkoff[i], kn).copy_(k8.narrow(0, ks, kn)); v_work.narrow(0, hkoff[i], kn).copy_(v8.narrow(0, ks, kn));
+            qt_work.narrow(2, hq[i], qn).copy_(qt8.narrow(2, qs, qn)); dot_work.narrow(2, hq[i], qn).copy_(dot8.narrow(2, qs, qn)); kt_work.narrow(2, hkoff[i], kn).copy_(kt8.narrow(2, ks, kn));
+        }
+        lse_work.zero_(); delta_work.zero_();
+        for (int i = 0; i < b; ++i) { int qs=cu_seqlens_q[i].item<int>(), qn=husedq[i]; lse_work.narrow(1,hq[i],qn).copy_(lse.transpose(0,1).narrow(1,qs,qn)); delta_work.narrow(1,hq[i],qn).copy_(delta.transpose(0,1).narrow(1,qs,qn)); }
+    }
+    at::Tensor dq = torch::empty({work_q, h, d}, opts.dtype(at::kBFloat16));
+    // The native epilogue accumulates one dK/dV tile per query head.  Fold the
+    // replicated GQA heads after the kernel, matching the fixed-shape API.
+    at::Tensor dk = torch::empty({work_k, h, d}, opts.dtype(at::kBFloat16));
+    at::Tensor dv = torch::empty({work_k, h, d}, opts.dtype(at::kBFloat16));
+    at::Tensor ds8 = torch::empty({int64_t(b) * h, nbm, nbn, 64, kbn}, opts);
+    at::Tensor psi = torch::empty({int64_t(b) * h, nbm, nbn, 1}, opts.dtype(at::kFloat));
+    at::Tensor dq_accum = torch::empty({int64_t(work_q) * h * d}, opts.dtype(at::kFloat));
+    at::Tensor sem = torch::empty({1}, opts.dtype(at::kInt));
+    at::Tensor lse_c = lse_work;
+    at::Tensor delta_c = delta_work;
+    Flash_bwd_fp8_params p{};
+    p.varlen = true; p.b = b; p.h = h; p.h_k = hk; p.total_q = work_q; p.total_k = work_k;
+    p.seqlen_q = max_seqlen_q; p.seqlen_k = max_seqlen_k; p.seqlen_q_rounded = max_seqlen_q; p.seqlen_k_rounded = max_seqlen_k;
+    p.d = d; p.dv = d; p.d_rounded = d; p.dv_rounded = d; p.scale_softmax = float(softmax_scale); p.is_causal = is_causal; p.is_bf16 = true;
+    p.q_ptr=q_work.data_ptr(); p.k_ptr=k_work.data_ptr(); p.v_ptr=v_work.data_ptr(); p.do_ptr=do_work.data_ptr();
+    p.q_row_stride=q_work.stride(0); p.q_head_stride=q_work.stride(1); p.q_batch_stride=0;
+    p.k_row_stride=k_work.stride(0); p.k_head_stride=k_work.stride(1); p.k_batch_stride=0;
+    p.v_row_stride=v_work.stride(0); p.v_head_stride=v_work.stride(1); p.v_batch_stride=0;
+    p.do_row_stride=do_work.stride(0); p.do_head_stride=do_work.stride(1); p.do_batch_stride=0;
+    p.dq_ptr=dq.data_ptr(); p.dk_ptr=dk.data_ptr(); p.dv_ptr=dv.data_ptr(); p.dq_row_stride=dq.stride(0); p.dq_head_stride=dq.stride(1); p.dq_batch_stride=0; p.dk_row_stride=dk.stride(0); p.dk_head_stride=dk.stride(1); p.dk_batch_stride=0; p.dv_row_stride=dv.stride(0); p.dv_head_stride=dv.stride(1); p.dv_batch_stride=0;
+    p.qt_ptr=qt_work.data_ptr(); p.kt_ptr=kt_work.data_ptr(); p.dot_ptr=dot_work.data_ptr(); p.q8s_ptr=q8s.data_ptr<float>(); p.k8s_ptr=k8s.data_ptr<float>(); p.v8s_ptr=v8s.data_ptr<float>(); p.do8s_ptr=do8s.data_ptr<float>(); p.nblk_q=q8s.size(2); p.nblk_k=k8s.size(2);
+    p.ds8_ptr=ds8.data_ptr(); p.psi_ptr=psi.data_ptr<float>(); p.dq_accum_ptr=dq_accum.data_ptr(); p.softmax_lse_ptr=lse_c.data_ptr(); p.softmax_lse_log2_ptr=lse_c.data_ptr(); p.dsoftmax_sum=delta_c.data_ptr(); p.tile_count_semaphore=sem.data_ptr<int>(); p.num_sm=at::cuda::getCurrentDeviceProperties()->multiProcessorCount; p.arch=90; p.cu_seqlens_q=cu_work.data_ptr<int>(); p.cu_seqlens_k=cu_k_work.data_ptr<int>(); p.seqused_q=needs_padding ? used_q.data_ptr<int>() : nullptr; p.seqused_k=needs_padding ? used_k.data_ptr<int>() : nullptr;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    if (d == 128) { if (is_causal) run_flash_bwd_fp11_varlen_d128<true>(p,stream); else run_flash_bwd_fp11_varlen_d128<false>(p,stream); }
+    else { if (is_causal) run_flash_bwd_fp11_varlen_d256<true>(p,stream); else run_flash_bwd_fp11_varlen_d256<false>(p,stream); }
+    auto fold_gqa = [&](at::Tensor x) {
+        return x.reshape({x.size(0), hk, h / hk, d}).sum(2);
+    };
+    if (!needs_padding) return {dq, fold_gqa(dk), fold_gqa(dv)};
+    auto dq_out = torch::empty({total_q, h, d}, opts.dtype(at::kBFloat16));
+    auto dk_out = torch::empty({total_k, hk, d}, opts.dtype(at::kBFloat16));
+    auto dv_out = torch::empty({total_k, hk, d}, opts.dtype(at::kBFloat16));
+    auto dk_fold = fold_gqa(dk), dv_fold = fold_gqa(dv);
+    for (int i=0;i<b;++i) { int qs=cu_seqlens_q[i].item<int>(), ks=cu_seqlens_k[i].item<int>(); int qn=used_q[i].item<int>(), kn=used_k[i].item<int>(); dq_out.narrow(0,qs,qn).copy_(dq.narrow(0,i*int(max_seqlen_q),qn)); dk_out.narrow(0,ks,kn).copy_(dk_fold.narrow(0,i*int(max_seqlen_k),kn)); dv_out.narrow(0,ks,kn).copy_(dv_fold.narrow(0,i*int(max_seqlen_k),kn)); }
+    return {dq_out, dk_out, dv_out};
 }
 
 // ## bf16-dP: bwd_fp8_t plus the RAW bf16 V and dO, i.e. SageBwd's single exemption among the
@@ -683,6 +991,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
 TORCH_LIBRARY(delta_matching, m) {
     m.def("fwd_fp8(Tensor q8, Tensor k8, Tensor v8, Tensor q8s, Tensor k8s, Tensor v8s,"
           " float softmax_scale, bool is_causal) -> (Tensor, Tensor)");
+    m.def("fwd_fp8_varlen(Tensor q8, Tensor k8, Tensor v8, Tensor q8s, Tensor k8s, Tensor v8s,"
+          " Tensor cu_seqlens_q, Tensor cu_seqlens_k, int max_seqlen_q, int max_seqlen_k,"
+          " float softmax_scale, bool is_causal) -> (Tensor, Tensor)");
     m.def("bwd_fp8(Tensor dout8, Tensor q8, Tensor k8, Tensor v8, Tensor lse, Tensor delta,"
           " Tensor kt8, Tensor q8s, Tensor k8s, Tensor v8s, Tensor do8s,"
           " float softmax_scale, bool is_causal) -> (Tensor, Tensor, Tensor)");
@@ -692,6 +1003,10 @@ TORCH_LIBRARY(delta_matching, m) {
     // ## FP11-M17 GT
     m.def("bwd_fp8_t(Tensor dout8, Tensor q8, Tensor k8, Tensor v8, Tensor lse, Tensor delta,"
           " Tensor kt8, Tensor qt8, Tensor dot8, Tensor q8s, Tensor k8s, Tensor v8s, Tensor do8s,"
+          " float softmax_scale, bool is_causal) -> (Tensor, Tensor, Tensor)");
+    m.def("bwd_fp8_varlen(Tensor dout8, Tensor q8, Tensor k8, Tensor v8, Tensor lse, Tensor delta,"
+          " Tensor kt8, Tensor qt8, Tensor dot8, Tensor q8s, Tensor k8s, Tensor v8s, Tensor do8s,"
+          " Tensor cu_seqlens_q, Tensor cu_seqlens_k, int max_seqlen_q, int max_seqlen_k,"
           " float softmax_scale, bool is_causal) -> (Tensor, Tensor, Tensor)");
     m.def("bwd_fp8_bf16dp(Tensor dout8, Tensor q8, Tensor k8, Tensor v8, Tensor lse, Tensor delta,"
           " Tensor kt8, Tensor qt8, Tensor dot8, Tensor q8s, Tensor k8s, Tensor v8s, Tensor do8s,"
@@ -722,9 +1037,11 @@ TORCH_LIBRARY_IMPL(delta_matching, CompositeExplicitAutograd, m) {
 
 TORCH_LIBRARY_IMPL(delta_matching, CUDA, m) {
     m.impl("fwd_fp8", &fwd_fp8);
+    m.impl("fwd_fp8_varlen", &fwd_fp8_varlen);
     m.impl("bwd_fp8", &bwd_fp8);
     m.impl("delta_fp8", &delta_fp8);
     m.impl("bwd_fp8_t", &bwd_fp8_t);
+    m.impl("bwd_fp8_varlen", &bwd_fp8_varlen);
     m.impl("bwd_fp8_bf16dp", &bwd_fp8_bf16dp);
     m.impl("twin_pi", &fp11_twin_pi);
 #ifdef FA3FP11_DBG

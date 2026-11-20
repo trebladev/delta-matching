@@ -173,9 +173,7 @@
 #if !defined(FLASHATTENTION_DISABLE_SPLIT) || (FLASHATTENTION_DISABLE_SPLIT) != 1
 #error "delta_matching: FLASHATTENTION_DISABLE_SPLIT must be 1 (the release flag set)"
 #endif
-#if !defined(FLASHATTENTION_DISABLE_VARLEN) || (FLASHATTENTION_DISABLE_VARLEN) != 1
-#error "delta_matching: FLASHATTENTION_DISABLE_VARLEN must be 1 (the release flag set)"
-#endif
+// Varlen is enabled for the packed FlashAttention-compatible entry points.
 #if defined(FA3FP11_ABL) && (FA3FP11_ABL) != 0
 #error "delta_matching: FA3FP11_ABL is fixed at 0 in this release"
 #endif
