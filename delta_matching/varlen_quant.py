@@ -92,7 +92,11 @@ def _pack_one(x: torch.Tensor, cu: torch.Tensor, h: int, D: int, kind: str,
             t = twin_pi(c.reshape(h, n, D)).contiguous()
             twin.append(t)
     packed = torch.cat(codes, dim=0) if codes else torch.empty((0, h, D), device=x.device, dtype=torch.float8_e4m3fn)
-    padded = torch.zeros((cu.numel() - 1, h, max_blocks), device=x.device, dtype=torch.float32)
+    # A varlen tile can cover masked keys beyond a sequence's logical end.
+    # The forward kernel still reads the complete tile's scale slots while
+    # constructing its per-group P/V basis.  Keep those unused slots finite
+    # and nonzero so a masked tail cannot create 0/0 in the basis ratios.
+    padded = torch.ones((cu.numel() - 1, h, max_blocks), device=x.device, dtype=torch.float32)
     for b, sc in enumerate(scales):
         padded[b, :, :sc.shape[1]] = sc
     tw = torch.cat(twin, dim=2) if want_twin else None
@@ -120,11 +124,11 @@ def quantize_packed(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     k8, k8s, kt = _pack_one(k, cu_seqlens_k, k.shape[1], D, "k", bn, True)
     v8, v8s, _ = _pack_one(v, cu_seqlens_k, v.shape[1], D, "v", bn, False)
     if max_seqlen_q is not None and q8s.size(2) < (int(max_seqlen_q) + bm - 1) // bm:
-        q8s = torch.nn.functional.pad(q8s, (0, (int(max_seqlen_q) + bm - 1) // bm - q8s.size(2)))
+        q8s = torch.nn.functional.pad(q8s, (0, (int(max_seqlen_q) + bm - 1) // bm - q8s.size(2)), value=1.0)
     if max_seqlen_k is not None and k8s.size(2) < (int(max_seqlen_k) + bn - 1) // bn:
         pad = (int(max_seqlen_k) + bn - 1) // bn - k8s.size(2)
-        k8s = torch.nn.functional.pad(k8s, (0, pad))
-        v8s = torch.nn.functional.pad(v8s, (0, pad))
+        k8s = torch.nn.functional.pad(k8s, (0, pad), value=1.0)
+        v8s = torch.nn.functional.pad(v8s, (0, pad), value=1.0)
     return {"q8": q8, "q8s": q8s, "k8": k8, "k8s": k8s, "v8": v8, "v8s": v8s,
             "q_t": qt, "k_t": kt}
 
