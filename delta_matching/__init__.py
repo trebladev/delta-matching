@@ -104,7 +104,7 @@ class _VarlenForward(torch.autograd.Function):
         from .core import _ops
         (q, k, v, cu_q, cu_k, q8, k8, v8, q8s, k8s, v8s,
          qt, kt, lse, o) = ctx.saved_tensors
-        if ctx.causal and q.shape[-1] == 256:
+        if ctx.causal and q.shape[-1] in (128, 256):
             return _VarlenForward._backward_reference(ctx, grad_o, q, k, v, cu_q, cu_k)
         if ctx.seqused_q is not None:
             return _VarlenForward._backward_seqused(
@@ -122,9 +122,9 @@ class _VarlenForward(torch.autograd.Function):
 
     @staticmethod
     def _backward_reference(ctx, grad_o, q, k, v, cu_q, cu_k):
-        """Reference backward for d256 causal Varlen.
+        """Reference backward for causal Varlen at supported head dimensions.
 
-        The native dQ pass2 still has an intermittent shared-fragment race on
+        The native dQ pass2 still has intermittent shared-fragment races on
         H200.  Recompute the exact causal softmax in FP32 so callers receive
         finite, correctly shaped gradients while that kernel path is isolated.
         """
