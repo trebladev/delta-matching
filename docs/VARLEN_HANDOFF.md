@@ -32,6 +32,7 @@
 - 逻辑前缀量化，物理 suffix code 置零，未使用输出置零，LSE 置为 `-inf`
 - padding scale slot 使用有限值 `1`
 - scheduler metadata 在当前 stream 上串行准备，避免 metadata 可见性竞态
+- d256 causal Varlen backward 在 H200 上使用 FP32 reference 重算，规避 native pass2 间歇性 dQ/dV 非有限值；d128 仍使用 native backward
 
 ## 未提交改动
 
