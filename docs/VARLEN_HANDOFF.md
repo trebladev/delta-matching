@@ -89,6 +89,8 @@ pip wheel --no-build-isolation --no-deps -w /tmp/dm-wheel-check .
 
 这说明问题位于 causal mixed-mask tile 的 kernel 路径，单纯的 host padding 没有解决它。优先检查：
 
+H200 上的最小矩阵已经进一步缩小为 Q 长度大于 K 长度时稳定触发。`Q=100,K=70,causal=True` 和 `Q=128,K=70,causal=True` 都产生 NaN，NaN 行固定为每个 64-row tile 中的混合区域。`Q=100,K=70,causal=False`、`Q=100,K=128,causal=True` 和 `Q=128,K=128,causal=True` 均为 finite。显式传入 `seqused_q=[Q]`、`seqused_k=[K]` 仍会触发，因此问题不在 host 端逻辑前缀元数据。
+
 1. `third_party/flash-attention/hopper/mask.h` 中 `causal_row_offset` 与 `SeqlenInfoQKNewK` 的实际长度组合
 2. `mainloop_fwd_sm90_fp8f.hpp` 中 mixed-mask tile 的 `fq8_descale`、softmax、PV promote 顺序
 3. fully masked 行与部分有效行共存时的 `tOrO` 初始化和 epilogue store
