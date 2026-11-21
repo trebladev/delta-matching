@@ -242,6 +242,29 @@ def flash_attn_varlen_func(
         raise TypeError("delta_matching: deterministic must be bool")
     if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
         raise TypeError("delta_matching: packed varlen q, k, v must be torch.bfloat16")
+    if causal and seqused_q is not None:
+        pieces = []
+        used_q_list = [int(x) for x in seqused_q.detach().cpu().tolist()]
+        used_k_list = [int(x) for x in seqused_k.detach().cpu().tolist()]
+        for b in range(cu_seqlens_q.numel() - 1):
+            q0, q1 = int(cu_seqlens_q[b]), int(cu_seqlens_q[b + 1])
+            k0, k1 = int(cu_seqlens_k[b]), int(cu_seqlens_k[b + 1])
+            storage_q, uq, uk = q1 - q0, used_q_list[b], used_k_list[b]
+            if uq == 0 or uk == 0:
+                pieces.append(q.new_zeros((storage_q, q.shape[1], q.shape[2])))
+                continue
+            extent = max(128, ((max(uq, uk) + 127) // 128) * 128)
+            qseg, kseg, vseg = q[q0:q0 + uq], k[k0:k0 + uk], v[k0:k0 + uk]
+            qtail = qseg[-1:].expand(extent - uq, -1, -1)
+            ktail = kseg[-1:].expand(extent - uk, -1, -1) if uk else k.new_zeros((extent, k.shape[1], k.shape[2]))
+            vtail = vseg[-1:].expand(extent - uk, -1, -1) if uk else v.new_zeros((extent, v.shape[1], v.shape[2]))
+            qp = torch.cat((qseg, qtail), dim=0)
+            kp = torch.cat((kseg, ktail), dim=0)
+            vp = torch.cat((vseg, vtail), dim=0)
+            z = torch.tensor([0, extent], device=q.device, dtype=torch.int32)
+            aligned = _VarlenForward.apply(qp, kp, vp, z, z, extent, extent, True, None, None)
+            pieces.append(torch.cat((aligned[:uq], q.new_zeros((storage_q - uq, q.shape[1], q.shape[2]))), dim=0))
+        return torch.cat(pieces, dim=0)
     # The SM90 causal mask has a numerically unstable mixed tile when the
     # query segment is longer than its key segment.  In FA3's aligned causal
     # convention, the first ``Q-K`` query rows are fully masked and the
