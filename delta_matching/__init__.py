@@ -242,6 +242,36 @@ def flash_attn_varlen_func(
         raise TypeError("delta_matching: deterministic must be bool")
     if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
         raise TypeError("delta_matching: packed varlen q, k, v must be torch.bfloat16")
+    # The SM90 causal mask has a numerically unstable mixed tile when the
+    # query segment is longer than its key segment.  In FA3's aligned causal
+    # convention, the first ``Q-K`` query rows are fully masked and the
+    # remaining rows are exactly an equal-length causal problem.  Launch the
+    # latter directly and materialize the fully masked prefix as zeros.  This
+    # keeps the autograd graph intact while avoiding the unstable tile.
+    if causal and seqused_q is None:
+        qlens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+        klens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+        if bool(((qlens > klens) | ((qlens % 128) != 0) | ((klens % 128) != 0)).any()):
+            pieces = []
+            for b in range(cu_seqlens_q.numel() - 1):
+                q0, q1 = int(cu_seqlens_q[b]), int(cu_seqlens_q[b + 1])
+                k0, k1 = int(cu_seqlens_k[b]), int(cu_seqlens_k[b + 1])
+                nq, nk = q1 - q0, k1 - k0
+                if nq == 0:
+                    pieces.append(q.new_empty((0, q.shape[1], q.shape[2])))
+                    continue
+                extent = max(128, ((max(nq, nk) + 127) // 128) * 128)
+                qseg, kseg, vseg = q[q0:q1], k[k0:k1], v[k0:k1]
+                qtail = qseg[-1:].expand(extent - nq, -1, -1) if nq else q.new_zeros((extent, q.shape[1], q.shape[2]))
+                ktail = kseg[-1:].expand(extent - nk, -1, -1) if nk else k.new_zeros((extent, k.shape[1], k.shape[2]))
+                vtail = vseg[-1:].expand(extent - nk, -1, -1) if nk else v.new_zeros((extent, v.shape[1], v.shape[2]))
+                qp = torch.cat((qseg, qtail), dim=0)
+                kp = torch.cat((kseg, ktail), dim=0)
+                vp = torch.cat((vseg, vtail), dim=0)
+                z = torch.tensor([0, extent], device=q.device, dtype=torch.int32)
+                aligned = _VarlenForward.apply(qp, kp, vp, z, z, extent, extent, True, None, None)
+                pieces.append(aligned[:nq])
+            return torch.cat(pieces, dim=0)
     result = _VarlenForward.apply(q, k, v, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), int(max_seqlen_k), bool(causal), seqused_q, seqused_k)
     return result
 

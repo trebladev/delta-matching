@@ -97,6 +97,13 @@ def _pack_one(x: torch.Tensor, cu: torch.Tensor, h: int, D: int, kind: str,
         c = torch.zeros((n, h, D), device=x.device, dtype=c_quant.dtype)
         c[:logical_n].copy_(c_quant[:logical_n])
         sc = sc.reshape(h, quant_n // blk).contiguous()
+        # Quantization of the temporary zero tail produces zero scale rows.
+        # The native causal kernel still consumes those rows while a tile
+        # contains both live and masked keys, so keep the tail scale slots
+        # finite and nonzero just like the batch-level padding below.
+        valid_blocks = (logical_n + blk - 1) // blk
+        if valid_blocks < sc.shape[1]:
+            sc[:, valid_blocks:] = 1.0
         codes.append(c)
         scales.append(sc)
         max_blocks = max(max_blocks, quant_n // blk)
