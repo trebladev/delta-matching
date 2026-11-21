@@ -86,7 +86,9 @@ class _VarlenForward(torch.autograd.Function):
         from .core import _ops
 
         ctx.seqused_q, ctx.seqused_k = seqused_q, seqused_k
-        p = quantize_packed(q, k, v, cu_q, cu_k, max_q, max_k, ctx.seqused_q, ctx.seqused_k)
+        need_twins = bool(q.requires_grad or k.requires_grad or v.requires_grad)
+        p = quantize_packed(q, k, v, cu_q, cu_k, max_q, max_k, ctx.seqused_q, ctx.seqused_k,
+                            need_twins=need_twins)
         o, lse = _ops().fwd_fp8_varlen(
             p["q8"], p["k8"], p["v8"], p["q8s"], p["k8s"], p["v8s"],
             cu_q, cu_k, int(max_q), int(max_k), float(q.shape[-1] ** -0.5), bool(causal),
@@ -104,8 +106,6 @@ class _VarlenForward(torch.autograd.Function):
         from .core import _ops
         (q, k, v, cu_q, cu_k, q8, k8, v8, q8s, k8s, v8s,
          qt, kt, lse, o) = ctx.saved_tensors
-        if ctx.causal and q.shape[-1] in (128, 256):
-            return _VarlenForward._backward_reference(ctx, grad_o, q, k, v, cu_q, cu_k)
         if ctx.seqused_q is not None:
             return _VarlenForward._backward_seqused(
                 ctx, grad_o, q, k, v, cu_q, cu_k, q8, k8, v8,
@@ -133,6 +133,36 @@ class _VarlenForward(torch.autograd.Function):
         dv = torch.zeros_like(v)
         used_q = [int(x) for x in ctx.seqused_q.detach().cpu().tolist()] if ctx.seqused_q is not None else None
         used_k = [int(x) for x in ctx.seqused_k.detach().cpu().tolist()] if ctx.seqused_k is not None else None
+        # Equal-length packed batches can share one batched reference graph.
+        # This avoids one FP32 autograd graph and several einsum launches per
+        # segment, which is the common decoder-prefill case.
+        with torch.enable_grad():
+            if used_q is None and used_k is None:
+                qlens = cu_q[1:] - cu_q[:-1]
+                klens = cu_k[1:] - cu_k[:-1]
+                if (qlens.numel() > 0 and bool((qlens == qlens[0]).all())
+                        and bool((klens == klens[0]).all()) and bool((qlens == klens[0]).all())):
+                    batch, nq, nk = qlens.numel(), int(qlens[0]), int(klens[0])
+                    qx = q.reshape(batch, nq, q.shape[1], q.shape[2]).detach().float().requires_grad_(True)
+                    kx = k.reshape(batch, nk, k.shape[1], k.shape[2]).detach().float().requires_grad_(True)
+                    vx = v.reshape(batch, nk, v.shape[1], v.shape[2]).detach().float().requires_grad_(True)
+                    # The packed fallback uses strict causal masking.  SDPA keeps
+                    # the GQA head grouping in one fused graph for this common
+                    # equal-length case while the explicit mask preserves that
+                    # diagonal-excluded convention.
+                    rows = torch.arange(nq, device=q.device)[:, None]
+                    cols = torch.arange(nk, device=q.device)[None, :]
+                    allow = cols < rows + nk - nq
+                    qh = qx.transpose(1, 2)
+                    kh = kx.transpose(1, 2)
+                    vh = vx.transpose(1, 2)
+                    ref = torch.nn.functional.scaled_dot_product_attention(
+                        qh, kh, vh, attn_mask=allow, dropout_p=0.0, enable_gqa=True
+                    ).transpose(1, 2)
+                    go = grad_o.reshape(batch, nq, grad_o.shape[1], grad_o.shape[2]).float()
+                    gq, gk, gv = torch.autograd.grad((ref * go).sum(), (qx, kx, vx))
+                    return (gq.to(q.dtype).reshape_as(q), gk.to(k.dtype).reshape_as(k),
+                    gv.to(v.dtype).reshape_as(v), None, None, None, None, None, None, None)
         with torch.enable_grad():
             for b in range(cu_q.numel() - 1):
                 q0, q1 = int(cu_q[b]), int(cu_q[b + 1])

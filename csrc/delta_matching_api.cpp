@@ -761,8 +761,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_varlen(
     // replicated GQA heads after the kernel, matching the fixed-shape API.
     at::Tensor dk = torch::empty({work_k, h, d}, opts.dtype(at::kBFloat16));
     at::Tensor dv = torch::empty({work_k, h, d}, opts.dtype(at::kBFloat16));
-    at::Tensor ds8 = torch::empty({int64_t(b) * h, nbm, nbn, 64, kbn}, opts);
-    at::Tensor psi = torch::empty({int64_t(b) * h, nbm, nbn, 1}, opts.dtype(at::kFloat));
+    // Varlen pass 1 does not necessarily publish every tile in the regular
+    // workspace.  Pass 2 still walks the full descriptor extent, so its
+    // sentinel metadata and dS' codes must start as exact zeros rather than
+    // reading allocator garbage for padded or fully masked tiles.
+    at::Tensor ds8 = torch::zeros({int64_t(b) * h, nbm, nbn, 64, kbn}, opts);
+    at::Tensor psi = torch::zeros({int64_t(b) * h, nbm, nbn, 1}, opts.dtype(at::kFloat));
     at::Tensor dq_accum = torch::empty({int64_t(work_q) * h * d}, opts.dtype(at::kFloat));
     at::Tensor sem = torch::empty({1}, opts.dtype(at::kInt));
     at::Tensor lse_c = lse_work;

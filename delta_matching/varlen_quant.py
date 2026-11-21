@@ -127,7 +127,8 @@ def _pack_one(x: torch.Tensor, cu: torch.Tensor, h: int, D: int, kind: str,
 def quantize_packed(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                     cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor,
                     max_seqlen_q: int | None = None, max_seqlen_k: int | None = None,
-                    seqused_q: torch.Tensor | None = None, seqused_k: torch.Tensor | None = None):
+                    seqused_q: torch.Tensor | None = None, seqused_k: torch.Tensor | None = None,
+                    need_twins: bool = True):
     """Quantize packed ``q``, ``k`` and ``v`` for a native varlen launch.
 
     Inputs use FlashAttention's packed layout ``(total_tokens, heads, head_dim)``.
@@ -152,11 +153,59 @@ def quantize_packed(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         if len(used_q) != cu_seqlens_q.numel() - 1 or len(used_k) != cu_seqlens_k.numel() - 1:
             raise ValueError("delta_matching: seqused tensors must have one value per batch")
     bm, bn = blocks(D)
-    q8, q8s, qt = _pack_one(q, cu_seqlens_q, q.shape[1], D, "q", bm, True, used_q)
-    k8, k8s, kt = _pack_one(k, cu_seqlens_k, k.shape[1], D, "k", bn, True, used_k)
+    # Uniform packed batches are common in decoder prefill (including Qwen3).
+    # Quantizing each segment independently launches three Triton producers per
+    # segment.  Batch the segments through the native GQA producer when their
+    # physical lengths match.  This preserves the packed result layout while
+    # reducing producer launches from O(batch) to O(1).
+    if seqused_q is None:
+        qlens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+        klens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+        if (qlens.numel() > 0 and bool((qlens == qlens[0]).all())
+                and bool((klens == klens[0]).all()) and bool((qlens == klens[0]).all())):
+            batch = qlens.numel()
+            nq = int(qlens[0])
+            qx = q.reshape(batch, nq, q.shape[1], D).permute(0, 2, 1, 3).contiguous()
+            kx = k.reshape(batch, nq, k.shape[1], D).permute(0, 2, 1, 3).contiguous()
+            vx = v.reshape(batch, nq, v.shape[1], D).permute(0, 2, 1, 3).contiguous()
+            Q8, Q8s, K8, K8s, V8, V8s, kTt = _quant_native(qx, kx, vx)
+            q8 = Q8.reshape(batch, q.shape[1], nq, D).permute(0, 2, 1, 3).reshape_as(q)
+            k8 = K8.reshape(batch, k.shape[1], nq, D).permute(0, 2, 1, 3).reshape_as(k)
+            v8 = V8.reshape(batch, v.shape[1], nq, D).permute(0, 2, 1, 3).reshape_as(v)
+            q8s = Q8s.reshape(batch, q.shape[1], -1).contiguous()
+            k8s = K8s.reshape(batch, k.shape[1], -1).contiguous()
+            v8s = V8s.reshape(batch, v.shape[1], -1).contiguous()
+            if max_seqlen_q is not None:
+                q_scale_rows = 64 if D == 128 else bm
+                needed = (int(max_seqlen_q) + q_scale_rows - 1) // q_scale_rows
+                if q8s.size(2) < needed:
+                    q8s = torch.nn.functional.pad(q8s, (0, needed - q8s.size(2)), value=1.0)
+            if max_seqlen_k is not None:
+                k_scale_tokens = int(max_seqlen_k)
+                if D == 128:
+                    k_scale_tokens = ((k_scale_tokens + 255) // 256) * 256
+                needed = (k_scale_tokens + bn - 1) // bn
+                if k8s.size(2) < needed:
+                    pad = needed - k8s.size(2)
+                    k8s = torch.nn.functional.pad(k8s, (0, pad), value=1.0)
+                    v8s = torch.nn.functional.pad(v8s, (0, pad), value=1.0)
+            qt = (twin_pi(Q8).reshape(batch, q.shape[1], D, nq).permute(1, 2, 0, 3)
+                  .reshape(q.shape[1], D, q.shape[0]).contiguous()) if need_twins else None
+            kt = (kTt.reshape(batch, k.shape[1], D, nq).permute(1, 2, 0, 3)
+                  .reshape(k.shape[1], D, k.shape[0]).contiguous()) if need_twins else None
+            return {"q8": q8, "q8s": q8s, "k8": k8, "k8s": k8s, "v8": v8, "v8s": v8s,
+                    "q_t": qt, "k_t": kt}
+    q8, q8s, qt = _pack_one(q, cu_seqlens_q, q.shape[1], D, "q", bm, need_twins, used_q)
+    k8, k8s, kt = _pack_one(k, cu_seqlens_k, k.shape[1], D, "k", bn, need_twins, used_k)
     v8, v8s, _ = _pack_one(v, cu_seqlens_k, v.shape[1], D, "v", bn, False, used_k)
-    if max_seqlen_q is not None and q8s.size(2) < (int(max_seqlen_q) + bm - 1) // bm:
-        q8s = torch.nn.functional.pad(q8s, (0, (int(max_seqlen_q) + bm - 1) // bm - q8s.size(2)), value=1.0)
+    if max_seqlen_q is not None:
+        # The d128 varlen dispatcher uses a 64-row Q descriptor even though
+        # the producer's native Q scale block is 128 rows.  Keep the extra
+        # finite slots so the launch descriptor can address its full extent.
+        q_scale_rows = 64 if D == 128 else bm
+        needed_q_blocks = (int(max_seqlen_q) + q_scale_rows - 1) // q_scale_rows
+        if q8s.size(2) < needed_q_blocks:
+            q8s = torch.nn.functional.pad(q8s, (0, needed_q_blocks - q8s.size(2)), value=1.0)
     if max_seqlen_k is not None:
         # The hd128 forward kernel stages K/V scale rows in 256-token
         # descriptor tiles, even though their quantization block is 64.
@@ -180,6 +229,22 @@ def quantize_dout_packed(dout: torch.Tensor, cu_seqlens_q: torch.Tensor,
     if dout.dim() != 3 or dout.dtype != torch.bfloat16:
         raise TypeError("delta_matching: packed dO must be bfloat16 [total, heads, d]")
     bm, _ = blocks(dout.shape[-1])
+    qlens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+    if qlens.numel() > 0 and bool((qlens == qlens[0]).all()):
+        batch, n = qlens.numel(), int(qlens[0])
+        x = dout.reshape(batch, n, dout.shape[1], dout.shape[2]).permute(0, 2, 1, 3).contiguous()
+        # _quant_native batches the producer launch.  Only its Q result is
+        # needed here, while the Q twin is the dO dot operand for backward.
+        q8, q8s, _, _, _, _, _ = _quant_native(x, x, x)
+        q8 = q8.reshape(batch, dout.shape[1], n, dout.shape[2]).permute(0, 2, 1, 3).reshape_as(dout)
+        qcodes = q8.reshape(batch, n, dout.shape[1], dout.shape[2]).permute(0, 2, 1, 3).reshape(batch * dout.shape[1], n, dout.shape[2])
+        dot = twin_pi(qcodes).reshape(batch, dout.shape[1], dout.shape[2], n).permute(1, 2, 0, 3).reshape(dout.shape[1], dout.shape[2], dout.shape[0]).contiguous()
+        q8s = q8s.reshape(batch, dout.shape[1], -1).contiguous()
+        if max_seqlen_q is not None:
+            needed = (int(max_seqlen_q) + (64 if dout.shape[-1] == 128 else bm) - 1) // (64 if dout.shape[-1] == 128 else bm)
+            if q8s.size(2) < needed:
+                q8s = torch.nn.functional.pad(q8s, (0, needed - q8s.size(2)), value=1.0)
+        return {"do8": q8, "do8s": q8s, "dot": dot}
     do8, do8s, dot = _pack_one(
         dout, cu_seqlens_q, dout.shape[1], dout.shape[2], "q", bm, True
     )
