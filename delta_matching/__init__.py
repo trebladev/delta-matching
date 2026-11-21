@@ -104,6 +104,8 @@ class _VarlenForward(torch.autograd.Function):
         from .core import _ops
         (q, k, v, cu_q, cu_k, q8, k8, v8, q8s, k8s, v8s,
          qt, kt, lse, o) = ctx.saved_tensors
+        if ctx.causal and q.shape[-1] == 256:
+            return _VarlenForward._backward_reference(ctx, grad_o, q, k, v, cu_q, cu_k)
         if ctx.seqused_q is not None:
             return _VarlenForward._backward_seqused(
                 ctx, grad_o, q, k, v, cu_q, cu_k, q8, k8, v8,
@@ -116,6 +118,49 @@ class _VarlenForward(torch.autograd.Function):
             do["do8"], q8, k8, v8, lse, delta, kt, qt, do["dot"],
             q8s, k8s, v8s, do["do8s"], cu_q, cu_k,
             ctx.max_q, ctx.max_k, float(q.shape[-1] ** -0.5), ctx.causal)
+        return dq, dk, dv, None, None, None, None, None, None, None
+
+    @staticmethod
+    def _backward_reference(ctx, grad_o, q, k, v, cu_q, cu_k):
+        """Reference backward for d256 causal Varlen.
+
+        The native dQ pass2 still has an intermittent shared-fragment race on
+        H200.  Recompute the exact causal softmax in FP32 so callers receive
+        finite, correctly shaped gradients while that kernel path is isolated.
+        """
+        dq = torch.zeros_like(q)
+        dk = torch.zeros_like(k)
+        dv = torch.zeros_like(v)
+        used_q = [int(x) for x in ctx.seqused_q.detach().cpu().tolist()] if ctx.seqused_q is not None else None
+        used_k = [int(x) for x in ctx.seqused_k.detach().cpu().tolist()] if ctx.seqused_k is not None else None
+        with torch.enable_grad():
+            for b in range(cu_q.numel() - 1):
+                q0, q1 = int(cu_q[b]), int(cu_q[b + 1])
+                k0, k1 = int(cu_k[b]), int(cu_k[b + 1])
+                nq = q1 - q0 if used_q is None else used_q[b]
+                nk = k1 - k0 if used_k is None else used_k[b]
+                if nq == 0 or nk == 0:
+                    continue
+                qx = q[q0:q0 + nq].detach().float().requires_grad_(True)
+                kx = k[k0:k0 + nk].detach().float().requires_grad_(True)
+                vx = v[k0:k0 + nk].detach().float().requires_grad_(True)
+                rep = qx.shape[1] // kx.shape[1]
+                kh = kx.repeat_interleave(rep, dim=1)
+                vh = vx.repeat_interleave(rep, dim=1)
+                scores = torch.einsum("qhd,khd->hqk", qx, kh) * (qx.shape[-1] ** -0.5)
+                rows = torch.arange(nq, device=q.device)[:, None]
+                cols = torch.arange(nk, device=q.device)[None, :]
+                masked = cols >= rows + nk - nq
+                scores = scores.masked_fill(masked, float("-inf"))
+                fully_masked = masked.all(dim=-1)
+                safe_scores = torch.where(fully_masked[None, :, None], torch.zeros_like(scores), scores)
+                probs = torch.softmax(safe_scores, dim=-1).masked_fill(fully_masked[None, :, None], 0.0)
+                ref = torch.einsum("hqk,khd->qhd", probs, vh)
+                go = grad_o[q0:q0 + nq].float()
+                gq, gk, gv = torch.autograd.grad((ref * go).sum(), (qx, kx, vx))
+                dq[q0:q0 + nq].copy_(gq.to(dq.dtype))
+                dk[k0:k0 + nk].copy_(gk.to(dk.dtype))
+                dv[k0:k0 + nk].copy_(gv.to(dv.dtype))
         return dq, dk, dv, None, None, None, None, None, None, None
 
     @staticmethod
