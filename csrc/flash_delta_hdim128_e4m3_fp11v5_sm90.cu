@@ -10,3 +10,10 @@ void run_flash_delta_fp11_d128(Flash_bwd_fp8_params &params, cudaStream_t stream
 }
 template void run_flash_delta_fp11_d128<true>(Flash_bwd_fp8_params &params, cudaStream_t stream);
 template void run_flash_delta_fp11_d128<false>(Flash_bwd_fp8_params &params, cudaStream_t stream);
+
+template <bool Is_causal>
+void run_flash_delta_fp11_varlen_d128(Flash_bwd_fp8_params &params, cudaStream_t stream) {
+    run_flash_delta_v6_fp11_varlen_hd128<Is_causal>(params, stream);
+}
+template void run_flash_delta_fp11_varlen_d128<true>(Flash_bwd_fp8_params &params, cudaStream_t stream);
+template void run_flash_delta_fp11_varlen_d128<false>(Flash_bwd_fp8_params &params, cudaStream_t stream);

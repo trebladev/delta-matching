@@ -34,9 +34,19 @@ def _bwd_streams(device):
     return _bwd_stream_pool[key]
 
 
-def _bwd_heads_per_call(B, H, Hkv, n_rep, N):
+def _bwd_heads_per_call(B, H, Hkv, n_rep, N, cu_padded_sq=None, total_padded_sq=None):
     """Query heads per backward call: H (no split), n_rep (per KV group) or 1 (per head)."""
-    ws = float(B) * N * N
+    # Dense compatibility uses B*N*N. Route-A packed sequences use the exact
+    # sum of per-sequence padded squares and avoid charging cross-sequence tiles.
+    if total_padded_sq is not None:
+        total_sq = float(total_padded_sq)
+    elif cu_padded_sq is None:
+        total_sq = float(B) * N * N
+    else:
+        if cu_padded_sq.numel() != B + 1:
+            raise ValueError("cu_padded_sq must have shape [B + 1]")
+        total_sq = float(cu_padded_sq[-1].item())
+    ws = total_sq
     if _BWD_GROUPS in ("off", "0", "1"):
         return H
     if _BWD_GROUPS == "kv":
@@ -95,3 +105,76 @@ def _bwd_by_head_groups(ops, a, sm, B, H, Hkv, n_rep, N, D, hp, matched_delta=Fa
         for s in streams:
             cur.wait_stream(s)
     return tuple(torch.cat([o[i] for o in outs], dim=2) for i in range(3))
+
+
+def _bwd_varlen_by_head_groups(
+    ops, a, cu, actual, cu_sq, total_padded_sq, sm,
+    H, Hkv, n_rep, T, D, hp, matched_delta=False, causal=True,
+):
+    """ops.bwd_fp8_t_varlen on hp query heads at a time (hp = n_rep or 1); packed 3-D layouts:
+    dO8/Q8 (T, H, D), K8kv/V8kv (T, Hkv, D), Lse/Dlt (H, T), kTtkv (Hkv, D, T), Qt/dOt (H, D, T),
+    Q8s/dO8s (H, nb_q), K8skv/V8skv (Hkv, nb_k). Returns (dq, dk, dv) each (T, H, D) bf16."""
+    dO8, Q8, K8kv, V8kv, Lse, Dlt, kTtkv, Qt, dOt, Q8s, K8skv, V8skv, dO8s = a
+    assert matched_delta or Dlt is not None, "the all-heads delta is required unless the delta is taken per group"
+    if matched_delta and D == 128:
+        Dlt = ops.delta_fp8_varlen(
+            dO8, Q8, K8kv, V8kv, Lse.contiguous(), kTtkv, Q8s, K8skv, V8skv, dO8s,
+            cu, actual, cu_sq, total_padded_sq, causal,
+        )
+        matched_delta = False
+    groups = list(range(0, H, hp))
+    K = min(_BWD_STREAMS, len(groups))
+    cur = torch.cuda.current_stream(dO8.device)
+    streams = _bwd_streams(dO8.device)[:K] if K > 1 else [cur]
+    if K > 1:
+        ready = torch.cuda.Event()
+        ready.record(cur)
+        for s in streams:
+            s.wait_event(ready)
+    outs = []
+    for i, h0 in enumerate(groups):
+        hs = slice(h0, h0 + hp)
+        g = h0 // n_rep
+        ks = slice(g, g + 1)
+        assert (h0 + hp - 1) // n_rep == g, "a call must stay inside one KV group"
+        s = streams[i % K]
+        with torch.cuda.stream(s):
+            dO8_g = dO8[:, hs]
+            Q8_g = Q8[:, hs]
+            K8_g = K8kv[:, ks]
+            V8_g = V8kv[:, ks]
+            if dO8_g.stride(-1) != 1:
+                dO8_g = dO8_g.contiguous()
+            if Q8_g.stride(-1) != 1:
+                Q8_g = Q8_g.contiguous()
+            if K8_g.stride(-1) != 1:
+                K8_g = K8_g.contiguous()
+            if V8_g.stride(-1) != 1:
+                V8_g = V8_g.contiguous()
+            Lse_g = Lse[hs].contiguous()
+            kTt_g = kTtkv[ks].contiguous()
+            Q8s_g = Q8s[hs].contiguous()
+            K8s_g = K8skv[ks].contiguous()
+            V8s_g = V8skv[ks].contiguous()
+            dO8s_g = dO8s[hs].contiguous()
+            if matched_delta:
+                Dlt_g = ops.delta_fp8_varlen(
+                    dO8_g, Q8_g, K8_g, V8_g, Lse_g, kTt_g, Q8s_g, K8s_g, V8s_g, dO8s_g,
+                    cu, actual, cu_sq, total_padded_sq, causal,
+                )
+            else:
+                Dlt_g = Dlt[hs].contiguous()
+            out = ops.bwd_fp8_t_varlen(
+                dO8_g, Q8_g, K8_g, V8_g, Lse_g, Dlt_g,
+                kTt_g, Qt[hs].contiguous(), dOt[hs].contiguous(),
+                Q8s_g, K8s_g, V8s_g, dO8s_g,
+                cu, actual, cu_sq, total_padded_sq, sm, causal,
+            )
+            if K > 1:
+                for t in out:
+                    t.record_stream(cur)
+            outs.append(out)
+    if K > 1:
+        for s in streams:
+            cur.wait_stream(s)
+    return tuple(torch.cat([o[i] for o in outs], dim=1) for i in range(3))

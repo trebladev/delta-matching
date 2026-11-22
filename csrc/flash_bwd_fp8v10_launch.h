@@ -16,6 +16,7 @@
 #include "flash.h"
 #include "flash_bwd_postprocess_kernel.h"
 #include "tile_scheduler.hpp"
+#include "dm_varlen_scheduler.hpp"
 #include "mainloop_bwd_sm90_fp8v10.hpp"
 #include "epilogue_bwd.hpp"
 #include "flash_bwd_kernel_sm90_fp8v10.h"
@@ -324,4 +325,214 @@ void run_flash_bwd_fp11_d256(Flash_bwd_fp8_params &params, cudaStream_t stream) 
 template <bool Is_causal>
 void run_flash_bwd_fp11_d128(Flash_bwd_fp8_params &params, cudaStream_t stream) {
     run_flash_bwd_fp11_impl<Is_causal, 128>(params, stream);
+}
+
+// Block-aligned varlen backward (head_dim 128): Pass 1 (P1-R, non-persistent single-tile) + Pass 2 (varlen dQ).
+template <bool Is_causal>
+void run_flash_bwd_fp11_varlen_d128(Flash_bwd_fp8_params &params, cudaStream_t stream) {
+    int const total_padded = params.total_q;
+    if (total_padded <= 0 || params.b <= 0 || params.total_padded_sq <= 0) { return; }
+    using Element = cutlass::float_e4m3_t;
+    using ElementOut = cutlass::bfloat16_t;
+    using ElementAccum = float;
+    using ArchTag = cutlass::arch::Sm90;
+    static constexpr int kBlockM = 64;
+    static constexpr int kBlockN = 128;
+    static constexpr int kHeadDim = 128;
+    using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
+    using ClusterShape = cute::Shape<_1, Int<1>, _1>;
+    using CollectiveMainloop = flash::CollectiveMainloopBwdSm90Fp8R<
+        FA3FP11_HD128_QST, FA3FP11_HD128_DOST, FA3FP11_HD128_DOTST, Is_causal, true /*Varlen*/>;
+    using CollectiveEpilogue = flash::CollectiveEpilogueBwd<
+        TileShape_MNK, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads,
+        true /*Varlen*/, false /*dKV_swapAB*/, 1 /*AtomLayoutKdKV*/>;
+    using Scheduler = flash::DMVarlenSingleTileBwdScheduler<kBlockN, Is_causal>;
+    using AttnKernel = flash::enable_sm90<flash::FlashAttnBwdSm90Fp8R<CollectiveMainloop, CollectiveEpilogue, Scheduler>>;
+
+    typename CollectiveMainloop::Arguments mainloop_args {
+        static_cast<Element const*>(params.q_ptr),
+        {total_padded, params.d, params.h, 1},
+        {params.q_row_stride, _1{}, params.q_head_stride, int64_t(0)},
+        static_cast<Element const*>(params.k_ptr),
+        {total_padded, params.d, params.h_k, 1},
+        {params.k_row_stride, _1{}, params.k_head_stride, int64_t(0)},
+#if FA3FP11_P1R_SAGEDP
+        static_cast<typename CollectiveMainloop::ElementDp const*>(params.vraw_ptr),
+        {total_padded, params.dv, params.h_k, 1},
+        {params.vraw_row_stride, _1{}, params.vraw_head_stride, int64_t(0)},
+        static_cast<typename CollectiveMainloop::ElementDp const*>(params.doraw_ptr),
+        {total_padded, params.dv, params.h, 1},
+        {params.doraw_row_stride, _1{}, params.doraw_head_stride, int64_t(0)},
+#else
+        static_cast<Element const*>(params.v_ptr),
+        {total_padded, params.dv, params.h_k, 1},
+        {params.v_row_stride, _1{}, params.v_head_stride, int64_t(0)},
+        static_cast<Element const*>(params.do_ptr),
+        {total_padded, params.dv, params.h, 1},
+        {params.do_row_stride, _1{}, params.do_head_stride, int64_t(0)},
+#endif
+        static_cast<Element const*>(params.qt_ptr),
+        {params.d, total_padded, params.h, 1},
+        {int64_t(total_padded), _1{}, int64_t(params.d) * total_padded, int64_t(0)},
+        static_cast<Element const*>(params.kt_ptr),
+        {params.d, total_padded, params.h_k, 1},
+        {int64_t(total_padded), _1{}, int64_t(params.d) * total_padded, int64_t(0)},
+        static_cast<Element const*>(params.dot_ptr),
+        {params.dv, total_padded, params.h, 1},
+        {int64_t(total_padded), _1{}, int64_t(params.dv) * total_padded, int64_t(0)},
+        params.q8s_ptr, params.k8s_ptr, params.v8s_ptr, params.do8s_ptr,
+        params.nblk_q, params.nblk_k,
+        static_cast<ElementAccum*>(params.dq_accum_ptr),
+        {total_padded * params.d_rounded, params.h, 1},
+        {_1{}, int64_t(total_padded) * params.d_rounded, int64_t(0)},
+        static_cast<float*>(params.softmax_lse_log2_ptr),
+        {total_padded, params.h, 1},
+        {_1{}, int64_t(total_padded), int64_t(0)},
+        static_cast<float*>(params.dsoftmax_sum),
+        {_1{}, int64_t(total_padded), int64_t(0)},
+        1.0f,
+        -1, -1, 0,
+        0.0f,
+        params.b,
+        params.dq_semaphore,
+        params.cu_seqlens_q, params.cu_seqlens_k, params.seqused_q, params.seqused_k,
+        static_cast<Element*>(params.ds8_ptr), params.psi_ptr,
+        total_padded / kBlockM, total_padded / kBlockN,
+        params.dlt_part_ptr, params.dbg_rows_ptr, params.dbg_rowsabs_ptr,
+        params.dbg_cks_ptr,
+        params.cu_padded_sq, params.total_padded_sq
+    };
+    typename CollectiveEpilogue::Arguments epilogue_args {
+        static_cast<ElementOut*>(params.dk_ptr),
+        {total_padded, params.d, params.h, 1},
+        {params.dk_row_stride, _1{}, params.dk_head_stride, int64_t(0)},
+        static_cast<ElementOut*>(params.dv_ptr),
+        {total_padded, params.dv, params.h, 1},
+        {params.dv_row_stride, _1{}, params.dv_head_stride, int64_t(0)},
+        params.b, params.h, params.dk_semaphore, params.dv_semaphore,
+        params.cu_seqlens_k, params.seqused_k,
+    };
+    int const num_blocks_n = total_padded / kBlockN;
+    typename flash::TileSchedulerArguments scheduler_args {
+        num_blocks_n, params.h, params.b, 1 /*num_splits*/,
+        params.h / params.h_k,
+        total_padded, total_padded, params.d, params.dv, sizeof(Element),
+        nullptr, params.cu_seqlens_k, params.seqused_k
+    };
+    int device;
+    cudaGetDevice(&device);
+    typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments(
+        {mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args});
+    dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
+    dim3 block_dims = AttnKernel::get_block_shape();
+    int smem_size = AttnKernel::SharedStorageSize;
+    if (smem_size >= 48 * 1024) {
+        CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<AttnKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    }
+    CHECK_CUTLASS(cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params, false /*launch_with_pdl*/));
+    run_fq8_dq_pass2_fp11_varlen_d128<Is_causal>(params, stream);
+}
+
+// Block-aligned varlen backward (head_dim 256): Pass 1 (V10, non-persistent single-tile) + Pass 2 (varlen dQ).
+template <bool Is_causal>
+void run_flash_bwd_fp11_varlen_d256(Flash_bwd_fp8_params &params, cudaStream_t stream) {
+    int const total_padded = params.total_q;
+    if (total_padded <= 0 || params.b <= 0 || params.total_padded_sq <= 0) { return; }
+    using Element = cutlass::float_e4m3_t;
+    using ElementOut = cutlass::bfloat16_t;
+    using ElementAccum = float;
+    using ArchTag = cutlass::arch::Sm90;
+    static constexpr int kBlockM = 64;
+    static constexpr int kBlockN = 64;
+    static constexpr int kHeadDim = 256;
+    static constexpr int Stages = 2;
+    static constexpr int Stages_dO = 2;
+    static constexpr int Stages_dS = 1;
+    using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
+    using ClusterShape = cute::Shape<_1, Int<1>, _1>;
+    using CollectiveMainloop = flash::CollectiveMainloopBwdSm90Fp8V10<
+        Stages, Stages_dO, Stages_dS, ClusterShape, TileShape_MNK, Element, ElementAccum, ArchTag,
+        Is_causal, false /*Is_local*/, false /*Has_softcap*/, true /*Varlen*/, false /*Deterministic*/,
+        false /*SdP_swapAB*/, true /*dKV_swapAB*/, true /*dQ_swapAB*/,
+        2 /*NumMmaWarpGroups*/, 1, 1, 1, false /*V_in_regs*/>;
+    using CollectiveEpilogue = flash::CollectiveEpilogueBwd<
+        TileShape_MNK, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads,
+        true /*Varlen*/, true /*dKV_swapAB*/, 2 /*AtomLayoutKdKV-ish*/>;
+    using Scheduler = flash::DMVarlenSingleTileBwdScheduler<kBlockN, Is_causal>;
+    using AttnKernel = flash::enable_sm90<flash::FlashAttnBwdSm90Fp8V10<
+        CollectiveMainloop, CollectiveEpilogue, Scheduler>>;
+
+    typename CollectiveMainloop::Arguments mainloop_args {
+        static_cast<Element const*>(params.q_ptr),
+        {total_padded, params.d, params.h, 1},
+        {params.q_row_stride, _1{}, params.q_head_stride, int64_t(0)},
+        static_cast<Element const*>(params.k_ptr),
+        {total_padded, params.d, params.h_k, 1},
+        {params.k_row_stride, _1{}, params.k_head_stride, int64_t(0)},
+        static_cast<Element const*>(params.v_ptr),
+        {total_padded, params.dv, params.h_k, 1},
+        {params.v_row_stride, _1{}, params.v_head_stride, int64_t(0)},
+        static_cast<Element const*>(params.do_ptr),
+        {total_padded, params.dv, params.h, 1},
+        {params.do_row_stride, _1{}, params.do_head_stride, int64_t(0)},
+        static_cast<Element const*>(params.qt_ptr),
+        {params.d, total_padded, params.h, 1},
+        {int64_t(total_padded), _1{}, int64_t(params.d) * total_padded, int64_t(0)},
+        static_cast<Element const*>(params.kt_ptr),
+        {params.d, total_padded, params.h_k, 1},
+        {int64_t(total_padded), _1{}, int64_t(params.d) * total_padded, int64_t(0)},
+        static_cast<Element const*>(params.dot_ptr),
+        {params.dv, total_padded, params.h, 1},
+        {int64_t(total_padded), _1{}, int64_t(params.dv) * total_padded, int64_t(0)},
+        params.q8s_ptr, params.k8s_ptr, params.v8s_ptr, params.do8s_ptr,
+        params.nblk_q, params.nblk_k,
+        static_cast<ElementAccum*>(params.dq_accum_ptr),
+        {total_padded * params.d_rounded, params.h, 1},
+        {_1{}, int64_t(total_padded) * params.d_rounded, int64_t(0)},
+        static_cast<float*>(params.softmax_lse_log2_ptr),
+        {total_padded, params.h, 1},
+        {_1{}, int64_t(total_padded), int64_t(0)},
+        static_cast<float*>(params.dsoftmax_sum),
+        {_1{}, int64_t(total_padded), int64_t(0)},
+        1.0f,
+        -1, -1, 0,
+        0.0f,
+        params.b,
+        params.dq_semaphore,
+        params.cu_seqlens_q, params.cu_seqlens_k, params.seqused_q, params.seqused_k,
+        static_cast<Element*>(params.ds8_ptr), params.psi_ptr,
+        total_padded / CollectiveMainloop::kBlockMh, total_padded / kBlockN,
+        params.dlt_part_ptr, params.dbg_rows_ptr, params.dbg_rowsabs_ptr,
+        params.dbg_cks_ptr,
+        params.cu_padded_sq, params.total_padded_sq
+    };
+    typename CollectiveEpilogue::Arguments epilogue_args {
+        static_cast<ElementOut*>(params.dk_ptr),
+        {total_padded, params.d, params.h, 1},
+        {params.dk_row_stride, _1{}, params.dk_head_stride, int64_t(0)},
+        static_cast<ElementOut*>(params.dv_ptr),
+        {total_padded, params.dv, params.h, 1},
+        {params.dv_row_stride, _1{}, params.dv_head_stride, int64_t(0)},
+        params.b, params.h, params.dk_semaphore, params.dv_semaphore,
+        params.cu_seqlens_k, params.seqused_k,
+    };
+    int const num_blocks_n = total_padded / kBlockN;
+    typename flash::TileSchedulerArguments scheduler_args {
+        num_blocks_n, params.h, params.b, 1 /*num_splits*/,
+        params.h / params.h_k,
+        total_padded, total_padded, params.d, params.dv, sizeof(Element),
+        nullptr, params.cu_seqlens_k, params.seqused_k
+    };
+    int device;
+    cudaGetDevice(&device);
+    typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments(
+        {mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args});
+    dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
+    dim3 block_dims = AttnKernel::get_block_shape();
+    int smem_size = AttnKernel::SharedStorageSize;
+    if (smem_size >= 48 * 1024) {
+        CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<AttnKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    }
+    CHECK_CUTLASS(cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params, false /*launch_with_pdl*/));
+    run_fq8_dq_pass2_fp11_varlen<Is_causal>(params, stream);
 }

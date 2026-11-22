@@ -17,8 +17,10 @@
 #include "static_switch.h"
 #include "flash.h"
 #include "tile_scheduler.hpp"
+#include "dm_varlen_scheduler.hpp"
 #include "mainloop_fwd_sm90_fp8f.hpp"
 #include "epilogue_fwd.hpp"
+#include "dm_epilogue_fwd_varlen.hpp"
 #include "flash_fwd_kernel_sm90_fq8f.h"
 #include "flash_fwd_fp8f_params.h"
 
@@ -27,7 +29,7 @@ using namespace cute;
 // ## Delta-Matching-128 (M19): the launch body is templated on the head dim; the d256 entry point
 // (run_flash_fwd_fp8f_d256) keeps its name and configuration verbatim, the d128 entry point instantiates
 // the same collective at kHeadDim 128 with the same 128 x 128 tile (FA3's own bf16 hd128 tile).
-template <bool Is_causal, int kHeadDim_>
+template <bool Is_causal, int kHeadDim_, bool Varlen = false>
 void run_flash_fwd_fp8f_impl(Flash_fwd_fp8_params &params, cudaStream_t stream) {
     using Element = cutlass::float_e4m3_t;
     using ElementOut = cutlass::bfloat16_t;
@@ -49,17 +51,24 @@ void run_flash_fwd_fp8f_impl(Flash_fwd_fp8_params &params, cudaStream_t stream) 
     using ClusterShape = cute::Shape<_1, _1, _1>;
     using CollectiveMainloop = flash::CollectiveMainloopFwdSm90Fp8F<
         kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, ArchTag,
-        Is_causal, false /*Is_local*/, false /*Has_softcap*/, false /*Varlen*/,
+        Is_causal, false /*Is_local*/, false /*Has_softcap*/, Varlen,
         false /*PagedKVNonTMA*/, false /*AppendKV*/, false /*HasQv*/,
         MmaPV_is_RS, IntraWGOverlap, false /*PackGQA*/, false /*Split*/, false /*V_colmajor*/>;
-    using CollectiveEpilogue = flash::CollectiveEpilogueFwd<
-        TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads,
-        false /*Varlen*/, false /*PackGQA*/, false /*Split*/, true /*FP8_TransposeV*/>;
+    using CollectiveEpilogue = std::conditional_t<Varlen,
+        flash::CollectiveEpilogueFwdVarlen<
+            TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads,
+            true /*FP8_TransposeV*/>,
+        flash::CollectiveEpilogueFwd<
+            TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads,
+            false /*Varlen*/, false /*PackGQA*/, false /*Split*/, true /*FP8_TransposeV*/>>;
     static constexpr int NumProducerThreads = CollectiveMainloop::NumProducerThreads;
-    using SchedulerPersistent = std::conditional_t<!Is_causal,
+    using SchedulerPersistent = std::conditional_t<Varlen,
+        flash::DMVarlenDynamicPersistentTileScheduler<kBlockM, CollectiveMainloop::NumMmaThreads, NumProducerThreads,
+                                                      true /*WarpSpecialized*/, Is_causal /*LPT*/, false /*IsBwd*/>,
+        std::conditional_t<!Is_causal,
         flash::StaticPersistentTileScheduler<false /*Split*/>,
         flash::DynamicPersistentTileScheduler<CollectiveMainloop::NumMmaThreads, NumProducerThreads,
-                                              false /*Split*/, false /*PackGQA*/, true /*WarpSpecialized*/>>;
+                                              false /*Split*/, false /*PackGQA*/, true /*WarpSpecialized*/>>>;
     using Scheduler = SchedulerPersistent;
     using AttnKernel = flash::enable_sm90<flash::FlashAttnFwdSm90Fq8F<CollectiveMainloop, CollectiveEpilogue, Scheduler>>;
 
@@ -68,14 +77,15 @@ void run_flash_fwd_fp8f_impl(Flash_fwd_fp8_params &params, cudaStream_t stream) 
         make_stride(params.v_row_stride, _1{}, params.v_head_stride, params.v_batch_stride);
     typename CollectiveMainloop::Arguments mainloop_args {
         static_cast<Element const*>(params.q_ptr),
-        {seqlen_q, params.d, params.h, params.b},  // shape_Q
-        {params.q_row_stride, _1{}, params.q_head_stride, params.q_batch_stride},
+        {seqlen_q, params.d, params.h, Varlen ? 1 : params.b},  // shape_Q
+        {params.q_row_stride, _1{}, params.q_head_stride, Varlen ? 0 : params.q_batch_stride},
         static_cast<Element*>(params.k_ptr),
-        {params.seqlen_k, params.d, params.h_k, params.b},  // shape_K
-        {params.k_row_stride, _1{}, params.k_head_stride, params.k_batch_stride},
+        {params.seqlen_k, params.d, params.h_k, Varlen ? 1 : params.b},  // shape_K
+        {params.k_row_stride, _1{}, params.k_head_stride, Varlen ? 0 : params.k_batch_stride},
         static_cast<Element*>(params.v_ptr),
         params.dv,  // headdim_v
-        v_strides,
+        make_stride(params.v_row_stride, _1{}, params.v_head_stride,
+                    int64_t(Varlen ? 0 : params.v_batch_stride)),
         nullptr,  // ptr_K_new
         {0, params.d, params.h_k, 1},  // shape_K_new
         {0, _1{}, 0, 0},
@@ -100,32 +110,37 @@ void run_flash_fwd_fp8f_impl(Flash_fwd_fp8_params &params, cudaStream_t stream) 
         0.0f,  // softcap
         1,     // num_splits
         nullptr,  // kv_batch_idx
-        nullptr, nullptr, nullptr,  // cu_seqlens
-        nullptr, nullptr,           // seqused
+        params.is_varlen ? params.cu_seqlens_padded : nullptr,
+        params.is_varlen ? params.cu_seqlens_padded : nullptr,
+        params.is_varlen ? params.cu_seqlens_padded : nullptr,  // cu_seqlens
+        params.is_varlen ? params.seqlens_actual : nullptr,
+        params.is_varlen ? params.seqlens_actual : nullptr,     // seqused
         nullptr, nullptr            // leftpad_k, seqlens_rotary
     };
     typename CollectiveEpilogue::Arguments epilogue_args {
         static_cast<ElementOut*>(params.o_ptr),
-        {seqlen_q, params.dv, params.h, params.b, 1},  // shape_O
-        {params.o_row_stride, _1{}, params.o_head_stride, params.o_batch_stride, 0},
+        {seqlen_q, params.dv, params.h, Varlen ? 1 : params.b, 1},  // shape_O
+        {params.o_row_stride, _1{}, params.o_head_stride, Varlen ? 0 : params.o_batch_stride, 0},
         nullptr,  // oaccum
         {0, _1{}, 0, 0, 0},
         static_cast<float*>(params.softmax_lse_ptr),
-        {_1{}, seqlen_q, params.h * seqlen_q, 0},  // stride_LSE
+        {_1{}, seqlen_q, Varlen ? 0 : params.h * seqlen_q, 0},  // stride_LSE
         nullptr,
         {_1{}, 0, 0, 0},
         params.h_k,
-        nullptr, nullptr
+        Varlen ? params.cu_seqlens_padded : nullptr,
+        Varlen ? params.seqlens_actual : nullptr
     };
 
     int num_blocks_m = cutlass::ceil_div(params.seqlen_q, get<0>(TileShape_MNK{}));
     num_blocks_m = cutlass::round_up(num_blocks_m, size<0>(ClusterShape{}));
     typename flash::TileSchedulerArguments scheduler_args {
-        num_blocks_m, params.h, params.b, 1 /*num_splits*/,
+        num_blocks_m, params.h, Varlen ? params.num_seqs : params.b, 1 /*num_splits*/,
         params.h / params.h_k,
         params.seqlen_q,
         params.seqlen_k, params.d, params.dv, sizeof(Element),
-        params.tile_count_semaphore, nullptr /*cu_seqlens_q*/, nullptr /*seqused_q*/,
+        params.tile_count_semaphore, Varlen ? params.cu_seqlens_padded : nullptr,
+        Varlen ? params.seqlens_actual : nullptr,
         nullptr, nullptr, nullptr, nullptr
     };
 
@@ -153,4 +168,14 @@ void run_flash_fwd_fp8f_d256(Flash_fwd_fp8_params &params, cudaStream_t stream) 
 template <bool Is_causal>
 void run_flash_fwd_fp8f_d128(Flash_fwd_fp8_params &params, cudaStream_t stream) {
     run_flash_fwd_fp8f_impl<Is_causal, 128>(params, stream);
+}
+
+template <bool Is_causal>
+void run_flash_fwd_fp8f_varlen_d256(Flash_fwd_fp8_params &params, cudaStream_t stream) {
+    run_flash_fwd_fp8f_impl<Is_causal, 256, true>(params, stream);
+}
+
+template <bool Is_causal>
+void run_flash_fwd_fp8f_varlen_d128(Flash_fwd_fp8_params &params, cudaStream_t stream) {
+    run_flash_fwd_fp8f_impl<Is_causal, 128, true>(params, stream);
 }

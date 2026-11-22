@@ -49,6 +49,7 @@
 #include "softmax.h"
 
 #include "flash_bwd_fp8_params.h"
+#include "dm_varlen_scheduler.hpp"
 
 // ## FP11-M17 P0MS (T2b, bitwise): m-split of the pass-0 CTAs for the causal tail.  With 256-key
 // CTAs the longest CTA (128 m-blocks x 4 n-blocks) is ~2/3 of the whole pass-0 time at H6 (384 CTAs =
@@ -69,8 +70,9 @@ using namespace cute;
 // unchanged).  At hd128 an n-block (64 keys) is ONE scale group (the [128, 64] contract): both 32-key halves of the
 // [BH, nbn, 2, N] slot layout carry the same k8s / v8s (the fixed-order reduce is unchanged), and the Q/dO scale is
 // per 128 rows (m-block >> 1).  Q/dO stages are 8 KB, K/V n-blocks 8 KB: 256 keys per CTA = 32 KB K/V resident.
-template <bool Is_causal, int kAtomN_, int kNbPerWG_, int kHeadDim_ = 256>
+template <bool Is_causal, int kAtomN_, int kNbPerWG_, int kHeadDim_ = 256, bool Varlen_ = false>
 struct DeltaV4 {
+    static constexpr bool Varlen = Varlen_;
     using Element = cutlass::float_e4m3_t;
     using ElementAccum = float;
     static constexpr int kBlockM = 64;
@@ -192,6 +194,11 @@ struct DeltaV4 {
         int const* unit_tab;   // ## FP11-M17 P0MS: [nunits][4] = (bh, group, m_lo, m_hi); nullptr when off
         int nunits;
         int num_heads;
+        int const* cu_seqlens_padded;
+        int const* seqlens_actual;
+        int64_t const* cu_padded_sq;
+        int64_t total_padded_sq;
+        int num_seqs;
     };
 
     CUTLASS_DEVICE
@@ -226,7 +233,34 @@ struct DeltaV4 {
         __syncthreads();
 
         int group, bidh, bidb, m_block_min, m_block_max;
-        if constexpr (FA3FP11_M17_P0MS > 0) {
+        int seq_idx = 0;
+        int offset_seq = 0;
+        int padded_len = get<0>(params.shape_Q);
+        int actual_len_q = get<0>(params.shape_Q);
+        int actual_len_k = get<0>(params.shape_K);
+        int nbn_seq = params.nbn;
+        if constexpr (Varlen) {
+            int const g128 = int(blockIdx.x);
+            bidh = int(blockIdx.y);
+            bidb = 0;
+            int const pos = g128 * 128;
+            seq_idx = dm_varlen_locate_seq(params.cu_seqlens_padded, params.num_seqs, pos);
+            offset_seq = params.cu_seqlens_padded[seq_idx];
+            padded_len = params.cu_seqlens_padded[seq_idx + 1] - offset_seq;
+            int const actual_len = params.seqlens_actual[seq_idx];
+            int const local_128 = (pos - offset_seq) / 128;
+            // kGroupN == 256 (two 128-key chunks per CTA): only even local_128 launch a CTA.
+            if ((local_128 & 1) != 0 || local_128 * 128 >= actual_len) { return; }
+            group = local_128 / 2;
+            actual_len_q = actual_len;
+            actual_len_k = actual_len;
+            nbn_seq = (actual_len + kBlockN - 1) / kBlockN;
+            int const nbm_seq = (actual_len + kBlockM - 1) / kBlockM;
+            int const nb0_ = kNbPerCTA * group;
+            m_block_min = Is_causal ? nb0_ : 0;
+            m_block_max = nbm_seq;
+            if (m_block_max <= m_block_min) { return; }
+        } else if constexpr (FA3FP11_M17_P0MS > 0) {
             // ## FP11-M17 P0MS: one work unit = (bh, group, [m_lo, m_hi)) from the host-built table.
             int const u = blockIdx.x;
             if (u >= params.nunits) { return; }
@@ -253,7 +287,7 @@ struct DeltaV4 {
             }
         }
         int const nb0 = kNbPerCTA * group;
-        SeqlenInfo_t seqlen_info{bidb, get<0>(params.shape_Q), size<0>(params.shape_K), nullptr, nullptr, nullptr, nullptr};
+        SeqlenInfo_t seqlen_info{bidb, actual_len_q, actual_len_k, nullptr, nullptr, nullptr, nullptr};
         int const bidh_kv = params.qhead_per_khead_divmod.divide(bidh);
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.smem_q.data()), SmemLayoutQ{});
@@ -271,9 +305,9 @@ struct DeltaV4 {
             Tensor mK = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, bidb);
             Tensor mV = params.tma_load_V.get_tma_tensor(params.shape_K)(_, _, bidh_kv, bidb);
             Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE_log2), params.shape_LSE, params.stride_LSE_log2)(_, bidh, bidb);
-            Tensor gQ = local_tile(mQ, select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));    // (M, K, nbm)
-            Tensor gdO = local_tile(mdO, select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));
-            Tensor gLSE = local_tile(mLSE, select<0>(TileShape_MNK{}), make_coord(_));           // (M, nbm)
+            Tensor gQ = local_tile(domain_offset(make_coord(offset_seq, _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));    // (M, K, nbm)
+            Tensor gdO = local_tile(domain_offset(make_coord(offset_seq, _0{}), mdO), select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));
+            Tensor gLSE = local_tile(domain_offset(make_coord(offset_seq), mLSE), select<0>(TileShape_MNK{}), make_coord(_));           // (M, nbm)
 
             auto block_tma_Q = params.tma_load_Q.get_slice(_0{});
             auto block_tma_dO = params.tma_load_dO.get_slice(_0{});
@@ -293,11 +327,13 @@ struct DeltaV4 {
                 // K/V: kNbPerCTA + kNbPerCTA one-shot tiles on the KV barrier (n-blocks past nbn load nb0: clamped, never stored).
                 auto& barKV = reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV);
                 shared_storage.pipelines.barrier_KV.arrive_and_expect_tx(2 * kNbPerCTA * TmaTransactionBytesK1);
+                Tensor mK_off = domain_offset(make_coord(offset_seq, _0{}), mK);
+                Tensor mV_off = domain_offset(make_coord(offset_seq, _0{}), mV);
                 #pragma unroll
                 for (int j = 0; j < kNbPerCTA; ++j) {
-                    int const nb = nb0 + j < params.nbn ? nb0 + j : nb0;
-                    Tensor gKj = local_tile(mK, select<1, 2>(TileShape_MNK{}), make_coord(nb, _0{}));      // (N, K)
-                    Tensor gVj = local_tile(mV, select<1, 2>(TileShape_MNK{}), make_coord(nb, _0{}));
+                    int const nb = nb0 + j < nbn_seq ? nb0 + j : nb0;
+                    Tensor gKj = local_tile(mK_off, select<1, 2>(TileShape_MNK{}), make_coord(nb, _0{}));      // (N, K)
+                    Tensor gVj = local_tile(mV_off, select<1, 2>(TileShape_MNK{}), make_coord(nb, _0{}));
                     auto [tKgK, tKsK] = kv_part(gKj, sK(_, _, j), params.tma_load_K);
                     auto [tVgV, tVsV] = kv_part(gVj, sV(_, _, j), params.tma_load_V);
                     copy(params.tma_load_K.with(barKV, 0), tKgK, tKsK);
@@ -347,6 +383,11 @@ struct DeltaV4 {
             // Scales (mma() bookkeeping, per KV head; per n-block j: two 32-key groups).
             int const fq8_bh = bidb * get<2>(params.shape_Q) + bidh;
             int const fq8_bh_kv = bidb * get<2>(params.shape_K) + bidh_kv;
+            int const k_blk_off = Varlen ? (offset_seq / kQuantKeys) : 0;
+            int const q_blk_off = Varlen ? (offset_seq / (kBlockM << kQShift)) : 0;
+            float* const part_seq = Varlen
+                ? (params.ptr_dltpart + (int64_t(bidh) * params.total_padded_sq + params.cu_padded_sq[seq_idx]) / 32)
+                : nullptr;
             float fq8_k8s_g0[kNbPerWG], fq8_k8s_g1[kNbPerWG], fq8_v8s_g0[kNbPerWG], fq8_v8s_g1[kNbPerWG];
             float* fq8_part_h0[kNbPerWG];
             float* fq8_part_h1[kNbPerWG];
@@ -354,19 +395,24 @@ struct DeltaV4 {
             #pragma unroll
             for (int j = 0; j < kNbPerWG; ++j) {
                 int const n_block = nb_base + j;
-                nb_valid[j] = n_block < params.nbn;
+                nb_valid[j] = n_block < nbn_seq;
                 int const nbc = nb_valid[j] ? n_block : nb0;   // clamped like the producer (values unused when invalid)
-                fq8_k8s_g0[j] = params.ptr_k8s[fq8_bh_kv * params.nblk_k + kScalesPerNb * nbc];
-                fq8_k8s_g1[j] = params.ptr_k8s[fq8_bh_kv * params.nblk_k + kScalesPerNb * nbc + (kScalesPerNb - 1)];
-                fq8_v8s_g0[j] = params.ptr_v8s[fq8_bh_kv * params.nblk_k + kScalesPerNb * nbc];
-                fq8_v8s_g1[j] = params.ptr_v8s[fq8_bh_kv * params.nblk_k + kScalesPerNb * nbc + (kScalesPerNb - 1)];
-                // This n-block's two half columns of the [BH, nbn, 2, N] workspace.
-                fq8_part_h0[j] = params.ptr_dltpart
-                    + ((int64_t(fq8_bh) * params.nbn + nbc) * 2 + 0) * int64_t(seqlen_q);
-                fq8_part_h1[j] = fq8_part_h0[j] + int64_t(seqlen_q);
+                fq8_k8s_g0[j] = params.ptr_k8s[fq8_bh_kv * params.nblk_k + k_blk_off + kScalesPerNb * nbc];
+                fq8_k8s_g1[j] = params.ptr_k8s[fq8_bh_kv * params.nblk_k + k_blk_off + kScalesPerNb * nbc + (kScalesPerNb - 1)];
+                fq8_v8s_g0[j] = params.ptr_v8s[fq8_bh_kv * params.nblk_k + k_blk_off + kScalesPerNb * nbc];
+                fq8_v8s_g1[j] = params.ptr_v8s[fq8_bh_kv * params.nblk_k + k_blk_off + kScalesPerNb * nbc + (kScalesPerNb - 1)];
+                // This n-block's two half columns of the partial workspace.
+                if constexpr (Varlen) {
+                    fq8_part_h0[j] = part_seq + int64_t(nbc * 2 + 0) * int64_t(padded_len);
+                    fq8_part_h1[j] = fq8_part_h0[j] + int64_t(padded_len);
+                } else {
+                    fq8_part_h0[j] = params.ptr_dltpart
+                        + ((int64_t(fq8_bh) * params.nbn + nbc) * 2 + 0) * int64_t(seqlen_q);
+                    fq8_part_h1[j] = fq8_part_h0[j] + int64_t(seqlen_q);
+                }
             }
-            float const* fq8_q8s_base = params.ptr_q8s + fq8_bh * params.nblk_q;
-            float const* fq8_do8s_base = params.ptr_do8s + fq8_bh * params.nblk_q;
+            float const* fq8_q8s_base = params.ptr_q8s + fq8_bh * params.nblk_q + q_blk_off;
+            float const* fq8_do8s_base = params.ptr_do8s + fq8_bh * params.nblk_q + q_blk_off;
             static constexpr float kFq8MoE = 8.0f;
             static constexpr float kFq8MoInv = 1.0f / 256.0f;
 
@@ -419,8 +465,11 @@ struct DeltaV4 {
                     a1 = flash::Allreduce<4>::run(a1, fq8_sum_op);
                     if ((wtid & 3) == 0 && nb_valid[j]) {
                         int const fq8_row = mi == 0 ? row0 : row1;
-                        fq8_part_h0[j][m_block * kBlockM + fq8_row] = a0 * kFq8MoInv;
-                        fq8_part_h1[j][m_block * kBlockM + fq8_row] = a1 * kFq8MoInv;
+                        int const r = m_block * kBlockM + fq8_row;
+                        if (!Varlen || r < seqlen_q) {
+                            fq8_part_h0[j][r] = a0 * kFq8MoInv;
+                            fq8_part_h1[j][r] = a1 * kFq8MoInv;
+                        }
                     }
                 }
             };
@@ -613,7 +662,8 @@ void run_flash_delta_v4_fp11_impl(Flash_bwd_fp8_params &params, cudaStream_t str
         params.dlt_part_ptr,
         nbm, nbn, ngroups, params.b,
         Kernel::Scheduler::to_underlying_arguments(scheduler_args),
-        unit_tab, nunits, params.h
+        unit_tab, nunits, params.h,
+        nullptr, nullptr, nullptr, 0, params.b
     };
     dim3 grid_dims = Kernel::Scheduler::get_grid_shape(kp.scheduler, params.num_sm);
     if constexpr (FA3FP11_M17_P0MS > 0) { grid_dims = dim3(nunits, 1, 1); }
@@ -643,4 +693,78 @@ void run_flash_delta_v4_fp11_impl(Flash_bwd_fp8_params &params, cudaStream_t str
 template <bool Is_causal>
 void run_flash_delta_v4_fp11_d256(Flash_bwd_fp8_params &params, cudaStream_t stream) {
     run_flash_delta_v4_fp11_impl<Is_causal, 256>(params, stream);
+}
+
+template <bool Is_causal>
+void run_flash_delta_v4_fp11_varlen_d256(Flash_bwd_fp8_params &params, cudaStream_t stream) {
+    using Kernel = flash::DeltaV4<Is_causal, FA3FP11_M16_P0V2_ATOMN, FA3FP11_M16_P0V3_NBWG, 256, true>;
+    using Element = typename Kernel::Element;
+    using namespace cute;
+    int const total_padded = params.seqlen_q;
+    if (total_padded == 0 || params.num_seqs == 0) { return; }
+    int const nbm = total_padded / Kernel::kBlockM;
+    int const nbn = total_padded / Kernel::kBlockN;
+    int const ngroups = total_padded / 128;
+
+    typename Kernel::ShapeQKV shape_Q = make_shape(total_padded, params.d, params.h, 1);
+    typename Kernel::StrideQKV stride_Q = make_stride(params.q_row_stride, _1{}, params.q_head_stride, params.q_batch_stride);
+    typename Kernel::StrideQKV stride_dO = make_stride(params.do_row_stride, _1{}, params.do_head_stride, params.do_batch_stride);
+    typename Kernel::ShapeQKV shape_K = make_shape(total_padded, params.d, params.h_k, 1);
+    typename Kernel::StrideQKV stride_K = make_stride(params.k_row_stride, _1{}, params.k_head_stride, params.k_batch_stride);
+    typename Kernel::StrideQKV stride_V = make_stride(params.v_row_stride, _1{}, params.v_head_stride, params.v_batch_stride);
+    Tensor mQ = make_tensor(make_gmem_ptr(static_cast<Element const*>(params.q_ptr)), shape_Q, stride_Q);
+    Tensor mdO = make_tensor(make_gmem_ptr(static_cast<Element const*>(params.do_ptr)), shape_Q, stride_dO);
+    Tensor mK = make_tensor(make_gmem_ptr(static_cast<Element const*>(params.k_ptr)), shape_K, stride_K);
+    Tensor mV = make_tensor(make_gmem_ptr(static_cast<Element const*>(params.v_ptr)), shape_K, stride_V);
+    typename Kernel::TMA_QdO tma_load_Q = make_tma_copy_A_sm90(
+        cute::SM90_TMA_LOAD{}, mQ, take<0, 2>(typename Kernel::SmemLayoutQ{}), typename Kernel::TileShape_MNK{}, typename Kernel::ClusterShape{});
+    typename Kernel::TMA_QdO tma_load_dO = make_tma_copy_A_sm90(
+        cute::SM90_TMA_LOAD{}, mdO, take<0, 2>(typename Kernel::SmemLayoutdO{}), typename Kernel::TileShape_MNK{}, typename Kernel::ClusterShape{});
+    typename Kernel::TMA_K tma_load_K = make_tma_copy_B_sm90(
+        cute::SM90_TMA_LOAD{}, mK, typename Kernel::SmemLayoutK1{}, typename Kernel::TileShape_MNK{}, typename Kernel::ClusterShape{});
+    typename Kernel::TMA_K tma_load_V = make_tma_copy_B_sm90(
+        cute::SM90_TMA_LOAD{}, mV, typename Kernel::SmemLayoutK1{}, typename Kernel::TileShape_MNK{}, typename Kernel::ClusterShape{});
+
+    typename flash::TileSchedulerArguments scheduler_args {
+        ngroups, params.h, 1, 1, params.h / params.h_k,
+        total_padded, total_padded, params.d, params.dv, sizeof(Element),
+        params.tile_count_semaphore, nullptr, nullptr
+    };
+    typename Kernel::Params kp {
+        shape_Q, shape_K,
+        cutlass::FastDivmod(params.h / params.h_k),
+        tma_load_Q, tma_load_dO, tma_load_K, tma_load_V,
+        params.q8s_ptr, params.k8s_ptr, params.v8s_ptr, params.do8s_ptr,
+        params.nblk_q, params.nblk_k,
+        static_cast<float const*>(params.softmax_lse_log2_ptr),
+        make_shape(total_padded, params.h, 1),
+        make_stride(_1{}, int64_t(total_padded), int64_t(params.h) * total_padded),
+        params.dlt_part_ptr,
+        nbm, nbn, ngroups, 1,
+        Kernel::Scheduler::to_underlying_arguments(scheduler_args),
+        nullptr, 0, params.h,
+        params.cu_seqlens_padded, params.seqlens_actual,
+        params.cu_padded_sq, params.total_padded_sq, params.num_seqs
+    };
+    dim3 grid_dims(ngroups, params.h, 1);
+    dim3 block_dims(Kernel::MaxThreadsPerBlock, 1, 1);
+    int smem_size = Kernel::SharedStorageSize;
+    auto kernel = cutlass::device_kernel<Kernel>;
+    if (smem_size >= 48 * 1024) {
+        CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    }
+    kernel<<<grid_dims, block_dims, smem_size, stream>>>(kp);
+    { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess) { fprintf(stderr, "[delta_matching pass 0 varlen d256] launch: %s\n", cudaGetErrorString(e_)); exit(1); } }
+
+    // PASS 0.5 varlen reduce
+    {
+        dim3 grid(nbm, params.h, 1);
+        fp11d::fp11_delta_reduce_varlen_kernel<<<grid, 64, 0, stream>>>(
+            params.dlt_part_ptr, params.dlt_ptr,
+            params.cu_seqlens_padded, params.seqlens_actual,
+            params.cu_padded_sq, params.total_padded_sq,
+            params.num_seqs, total_padded, Is_causal);
+        cudaError_t e_ = cudaGetLastError();
+        if (e_ != cudaSuccess) { fprintf(stderr, "[delta_matching pass 0.5 varlen] launch: %s\n", cudaGetErrorString(e_)); exit(1); }
+    }
 }

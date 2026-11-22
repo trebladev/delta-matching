@@ -472,9 +472,15 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
     static constexpr bool ShuffleLSE = SdP_swapAB && kHeadDim <= 64;
     static constexpr bool ShuffledPsum = SdP_swapAB && kHeadDim <= 64;
     // ## V10 (split bwd): TMA tile-store of the natural dS' smem tile into
-    // [BH, nbm, nbn, 64, 64] gmem (tile-contiguous for the pass-2 GEMM).
-    using ShapeDS8 = cute::Shape<Int<kBlockMh>, Int<kBlockN>, int32_t, int32_t, int32_t>;
-    using StrideDS8 = cute::Stride<Int<kBlockN>, _1, int64_t, int64_t, int64_t>;
+    // [BH, nbm, nbn, 64, 64] gmem (dense) or [total_tiles, 64, 64] (varlen).
+    using ShapeDS8 = std::conditional_t<
+        Varlen,
+        cute::Shape<Int<kBlockMh>, Int<kBlockN>, int32_t>,
+        cute::Shape<Int<kBlockMh>, Int<kBlockN>, int32_t, int32_t, int32_t>>;
+    using StrideDS8 = std::conditional_t<
+        Varlen,
+        cute::Stride<Int<kBlockN>, _1, int64_t>,
+        cute::Stride<Int<kBlockN>, _1, int64_t, int64_t, int64_t>>;
     using TMA_dS8 = decltype(make_tma_copy(
         cute::SM90_TMA_STORE{},
         make_tensor(make_gmem_ptr(static_cast<Element*>(nullptr)), ShapeDS8{}, StrideDS8{}),
@@ -632,6 +638,8 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
         float* const ptr_dbg_rows;      // [BH, nbn, 2, N] fp32 (pass-1 dS row-sum partials)
         float* const ptr_dbg_rowsabs;   // [BH, nbn, 2, N] fp32 (sum |dS|)
         unsigned int* const ptr_dbg_cks;  // [2, BH, nbm, nbn] u32 (XOR of P~ / dP~ fragment bits)
+        int64_t const* const cu_padded_sq = nullptr;
+        int64_t const total_padded_sq = 0;
     };
 
     // Device side kernel params
@@ -684,6 +692,8 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
         float* const ptr_dbg_rows;
         float* const ptr_dbg_rowsabs;
         unsigned int* const ptr_dbg_cks;
+        int64_t const* const cu_padded_sq;
+        int64_t const total_padded_sq;
     };
 
     static Params
@@ -728,14 +738,23 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
         TMA_dOt tma_load_dOt = make_tma_copy_A_sm90(
             cute::SM90_TMA_LOAD{}, mdOt, take<0, 2>(SmemLayoutdOt{}), TileShape_TwinM{}, ClusterShape{});
         // ## V10 (split bwd): the dS8 tile-store TMA (de-swizzles SmemLayoutPdS).
-        Tensor mDS8 = make_tensor(make_gmem_ptr(args.ptr_dS8),
-            make_shape(Int<kBlockMh>{}, Int<kBlockN>{}, args.nbn, args.nbm,
-                       args.num_batch * get<2>(args.shape_Q)),
-            make_stride(Int<kBlockN>{}, _1{}, int64_t(kBlockMh) * kBlockN,
-                        int64_t(kBlockMh) * kBlockN * args.nbn,
-                        int64_t(kBlockMh) * kBlockN * args.nbn * args.nbm));
-        TMA_dS8 tma_store_dS8 = make_tma_copy(
-            cute::SM90_TMA_STORE{}, mDS8, SmemLayoutPdS{}(_, _, _0{}));
+        TMA_dS8 tma_store_dS8 = [&] {
+            if constexpr (Varlen) {
+                int32_t const total_tiles = int32_t((int64_t(get<2>(args.shape_Q)) * args.total_padded_sq) / (int64_t(kBlockMh) * kBlockN));
+                Tensor mDS8 = make_tensor(make_gmem_ptr(args.ptr_dS8),
+                    make_shape(Int<kBlockMh>{}, Int<kBlockN>{}, total_tiles),
+                    make_stride(Int<kBlockN>{}, _1{}, int64_t(kBlockMh) * kBlockN));
+                return make_tma_copy(cute::SM90_TMA_STORE{}, mDS8, SmemLayoutPdS{}(_, _, _0{}));
+            } else {
+                Tensor mDS8 = make_tensor(make_gmem_ptr(args.ptr_dS8),
+                    make_shape(Int<kBlockMh>{}, Int<kBlockN>{}, args.nbn, args.nbm,
+                               args.num_batch * get<2>(args.shape_Q)),
+                    make_stride(Int<kBlockN>{}, _1{}, int64_t(kBlockMh) * kBlockN,
+                                int64_t(kBlockMh) * kBlockN * args.nbn,
+                                int64_t(kBlockMh) * kBlockN * args.nbn * args.nbm));
+                return make_tma_copy(cute::SM90_TMA_STORE{}, mDS8, SmemLayoutPdS{}(_, _, _0{}));
+            }
+        }();
         if constexpr (Deterministic) { assert(args.dq_semaphore != nullptr); }
         // Avoid dividing by zero
         cutlass::FastDivmod attention_chunk_divmod(args.attention_chunk >= 1 ? args.attention_chunk : 1);
@@ -768,7 +787,7 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
                 args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k,
                 tma_store_dS8, args.ptr_psi, args.nbm, args.nbn,
                 args.ptr_dltpart, args.ptr_dbg_rows, args.ptr_dbg_rowsabs,
-                args.ptr_dbg_cks};
+                args.ptr_dbg_cks, args.cu_padded_sq, args.total_padded_sq};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -1020,8 +1039,8 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
         // The twins are [d, seq, head, batch] (seq contiguous), (d, seq) = shape_Q's modes swapped.
         auto shape_Qt = make_shape(get<1>(params.shape_Q), get<0>(params.shape_Q), get<2>(params.shape_Q), get<3>(params.shape_Q));
         auto shape_dOt = make_shape(get<1>(params.shape_dO), get<0>(params.shape_dO), get<2>(params.shape_dO), get<3>(params.shape_dO));
-        Tensor mQt = params.tma_load_Qt.get_tma_tensor(shape_Qt)(_, _, bidh, bidb);
-        Tensor mdOt = params.tma_load_dOt.get_tma_tensor(shape_dOt)(_, _, bidh, bidb);
+        Tensor mQt = params.tma_load_Qt.get_tma_tensor(shape_Qt)(_, _, bidh, !is_varlen_q ? bidb : 0);
+        Tensor mdOt = params.tma_load_dOt.get_tma_tensor(shape_dOt)(_, _, bidh, !is_varlen_q ? bidb : 0);
         Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE_log2), params.shape_LSE, params.stride_LSE_log2)(_, bidh, !is_varlen_q ? bidb : 0);
         Tensor mdPsum = make_tensor(make_gmem_ptr(params.ptr_dPsum), params.shape_LSE, params.stride_dPsum)(_, bidh, !is_varlen_q ? bidb : 0);
 
@@ -1029,10 +1048,11 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
         Tensor gdO = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mdO), select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (M, K, _)
         Tensor gK = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}), mK), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (N, K)
         Tensor gV = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}), mV), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (N, K)
-        Tensor gQt = local_tile(mQt, make_shape(Int<kHeadDim>{}, Int<kBlockM>{}), make_coord(_0{}, _));    // (D, M, _)
-        Tensor gdOt = local_tile(mdOt, make_shape(Int<kHeadDim>{}, Int<kBlockM>{}), make_coord(_0{}, _));  // (D, M, _)
-        Tensor gLSE = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded), mLSE), select<0>(TileShape_MNK{}), make_coord(_));  // (M, _)
-        Tensor gdPsum = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded), mdPsum), select<0>(TileShape_MNK{}), make_coord(_));  // (M, _)
+        Tensor gQt = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_q), mQt), make_shape(Int<kHeadDim>{}, Int<kBlockM>{}), make_coord(_0{}, _));    // (D, M, _)
+        Tensor gdOt = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_q), mdOt), make_shape(Int<kHeadDim>{}, Int<kBlockM>{}), make_coord(_0{}, _));  // (D, M, _)
+        int const lse_offset = Varlen ? seqlen_info.offset_q : seqlen_info.offset_q_padded;
+        Tensor gLSE = local_tile(domain_offset(make_coord(lse_offset), mLSE), select<0>(TileShape_MNK{}), make_coord(_));  // (M, _)
+        Tensor gdPsum = local_tile(domain_offset(make_coord(lse_offset), mdPsum), select<0>(TileShape_MNK{}), make_coord(_));  // (M, _)
 
         Tensor sK_x = make_tensor(sK.data(), make_layout(sK.layout(), Layout<_1>{}));
         Tensor gK_x = make_tensor(gK.data(), make_layout(gK.layout(), Layout<_1>{}));
@@ -1676,21 +1696,33 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
         // +1} and each warpgroup owns one 32-column half of the SdP tile (WG w ->
         // half w by the tiled-mma N-mode order).  MO: P-hat = 2^8 * P folds into
         // exp2 as +8; the 2^8 rides dS into psi and is divided out downstream.
-        int const fq8_bh = get<2>(block_coord) * get<2>(params.shape_Q) + bidh;
+        int const fq8_bh = Varlen ? bidh : (get<2>(block_coord) * get<2>(params.shape_Q) + bidh);
         // ## FP11-M16 (native GQA, READ side): the K/V scales are indexed by
         // KV head (b, h_k, nblk_k), exactly as the K/V/Kt TMA tensors already
         // are (bidh_kv).  With h_k == h this is the M10 arithmetic verbatim
         // (divide by 1); with h_k < h the bytes read per query head are the
         // same as from an expanded copy: bitwise by construction.  Every
         // per-query-head workspace (dS8, psi, delta partials) keeps fq8_bh.
-        int const fq8_bh_kv = get<2>(block_coord) * get<2>(params.shape_K)
-            + params.qhead_per_khead_divmod.divide(bidh);
-        float const fq8_k8s_wg = params.ptr_k8s[fq8_bh_kv * params.nblk_k + 2 * n_block + warp_group_idx];
-        float const fq8_k8s_g0 = params.ptr_k8s[fq8_bh_kv * params.nblk_k + 2 * n_block];
-        float const fq8_k8s_g1 = params.ptr_k8s[fq8_bh_kv * params.nblk_k + 2 * n_block + 1];
-        float const fq8_v8s_wg = params.ptr_v8s[fq8_bh_kv * params.nblk_k + 2 * n_block + warp_group_idx];
-        float const* fq8_q8s_base = params.ptr_q8s + fq8_bh * params.nblk_q;
-        float const* fq8_do8s_base = params.ptr_do8s + fq8_bh * params.nblk_q;
+        int const fq8_bh_kv = Varlen
+            ? params.qhead_per_khead_divmod.divide(bidh)
+            : (get<2>(block_coord) * get<2>(params.shape_K) + params.qhead_per_khead_divmod.divide(bidh));
+        int const fq8_k_blk_off = Varlen ? (seqlen_info.offset_k / kQuantKeys) : 0;
+        int const fq8_q_blk_off = Varlen ? (seqlen_info.offset_q / kQuantRowsQ) : 0;
+        float const fq8_k8s_wg = params.ptr_k8s[fq8_bh_kv * params.nblk_k + fq8_k_blk_off + 2 * n_block + warp_group_idx];
+        float const fq8_k8s_g0 = params.ptr_k8s[fq8_bh_kv * params.nblk_k + fq8_k_blk_off + 2 * n_block];
+        float const fq8_k8s_g1 = params.ptr_k8s[fq8_bh_kv * params.nblk_k + fq8_k_blk_off + 2 * n_block + 1];
+        float const fq8_v8s_wg = params.ptr_v8s[fq8_bh_kv * params.nblk_k + fq8_k_blk_off + 2 * n_block + warp_group_idx];
+        float const* fq8_q8s_base = params.ptr_q8s + fq8_bh * params.nblk_q + fq8_q_blk_off;
+        float const* fq8_do8s_base = params.ptr_do8s + fq8_bh * params.nblk_q + fq8_q_blk_off;
+        int const fq8_padded_len_k = Varlen ? (params.cu_seqlens_k[bidb + 1] - params.cu_seqlens_k[bidb]) : 0;
+        int const fq8_nbn_seq = Varlen ? (fq8_padded_len_k / kBlockN) : params.nbn;
+        int64_t const fq8_total_tiles_per_head = Varlen ? (params.total_padded_sq / (int64_t(kBlockMh) * kBlockN)) : 0;
+        int64_t const fq8_tile_base_seq = Varlen
+            ? (int64_t(bidh) * fq8_total_tiles_per_head + params.cu_padded_sq[bidb] / (int64_t(kBlockMh) * kBlockN))
+            : 0;
+        int32_t const fq8_total_tiles_ds8 = Varlen
+            ? int32_t(int64_t(get<2>(params.shape_Q)) * fq8_total_tiles_per_head)
+            : 0;
         // ## FQ8-V9: software-pipeline the per-m-block scale loads (global
         // scalar fetches were a top long-scoreboard source).
         // ## Delta-Matching-128: the Q/dO scale block index of an m-block (m-block at d256; m-block / 2 at hd128).
@@ -1845,6 +1877,17 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
             mask_fn(tSrS, m_block);
             #pragma unroll
             for (int i = 0; i < size(scores); ++i) { scores(i) = exp2f(scores(i)); }
+            if constexpr (Varlen) {
+                if ((m_block + 1) * kBlockM > seqlen_q) {
+                    #pragma unroll
+                    for (int mi = 0; mi < size<0>(scores); ++mi) {
+                        if (m_block * kBlockM + get<0>(tScS_rc(mi, _0{})) >= seqlen_q) {
+                            #pragma unroll
+                            for (int ni = 0; ni < size<1>(scores); ++ni) { scores(mi, ni) = 0.0f; }
+                        }
+                    }
+                }
+            }
             }   // kAbl & 32
 
             Tensor tLSErdPsum = cute::conditional_return<!ShuffledPsum>(make_fragment_like(tLSEsdPsum(_, _0{})), make_tensor<ElementAccum>(Int<kStatsPerThread>{}));
@@ -1924,10 +1967,20 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
                     fq8_rb = flash::Allreduce<4>::run(fq8_rb, fq8_dbg_sum);
                     if ((thread_idx & 3) == 0) {
                         int const fq8_row = get<0>(tScS_rc(mi, _0{}));
-                        int64_t const fq8_gi = ((int64_t(fq8_bh) * params.nbn + n_block) * 2
-                            + warp_group_idx) * int64_t(seqlen_q) + m_block * kBlockM + fq8_row;
-                        params.ptr_dbg_rows[fq8_gi] = fq8_ra;
-                        params.ptr_dbg_rowsabs[fq8_gi] = fq8_rb;
+                        int const fq8_r = m_block * kBlockM + fq8_row;
+                        if constexpr (Varlen) {
+                            if (fq8_r < seqlen_q) {
+                                int64_t const fq8_gi = (int64_t(bidh) * params.total_padded_sq + params.cu_padded_sq[bidb]) / 32
+                                    + int64_t(n_block * 2 + warp_group_idx) * int64_t(fq8_padded_len_k) + fq8_r;
+                                params.ptr_dbg_rows[fq8_gi] = fq8_ra;
+                                params.ptr_dbg_rowsabs[fq8_gi] = fq8_rb;
+                            }
+                        } else {
+                            int64_t const fq8_gi = ((int64_t(fq8_bh) * params.nbn + n_block) * 2
+                                + warp_group_idx) * int64_t(seqlen_q) + fq8_r;
+                            params.ptr_dbg_rows[fq8_gi] = fq8_ra;
+                            params.ptr_dbg_rowsabs[fq8_gi] = fq8_rb;
+                        }
                     }
                 }
             }
@@ -1950,6 +2003,17 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
                     // divides it back out).  Kills the split-K dQ.
                     dS(mi, ni) = scores(mi, ni) * (dS(mi, ni) * fq8_dp_descale_f - dP_sum_cur_f);
                     if constexpr (Has_softcap) { dS(mi, ni) *= dtanh(mi, ni); }
+                }
+            }
+            if constexpr (Varlen) {
+                if ((m_block + 1) * kBlockM > seqlen_q) {
+                    #pragma unroll
+                    for (int mi = 0; mi < size<0>(dS); ++mi) {
+                        if (m_block * kBlockM + get<0>(tScS_rc(mi, _0{})) >= seqlen_q) {
+                            #pragma unroll
+                            for (int ni = 0; ni < size<1>(dS); ++ni) { dS(mi, ni) = 0.0f; }
+                        }
+                    }
                 }
             }
             }   // kAbl & 32
@@ -2009,8 +2073,10 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
             // ## V10 (split bwd): publish this tile's psi for pass 2 (0.0f = the
             // FP11-F2 zero-tile sentinel).
             if (thread_idx == 0) {
-                params.ptr_psi[(int64_t(fq8_bh) * params.nbm + m_block) * params.nbn + n_block]
-                    = fq8_tile_zero ? 0.0f : fq8_psi;
+                int64_t const fq8_tile_idx = Varlen
+                    ? (fq8_tile_base_seq + int64_t(m_block) * fq8_nbn_seq + n_block)
+                    : ((int64_t(fq8_bh) * params.nbm + m_block) * params.nbn + n_block);
+                params.ptr_psi[fq8_tile_idx] = fq8_tile_zero ? 0.0f : fq8_psi;
             }
 
             // ## FQ8: P-hat codes = e4m3(2^8 * P) (scores already carry 2^8; the
@@ -2088,14 +2154,23 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
                     // was its only consumer).  Drained at the next
                     // iteration's PdS wait.
                     if (!(kAbl & 4) && thread_idx == 0) {
-                        Tensor mdS8 = params.tma_store_dS8.get_tma_tensor(
-                            make_shape(Int<kBlockM>{}, Int<kBlockN>{}, params.nbn, params.nbm,
-                                       params.num_batch * get<2>(params.shape_Q)));
-                        Tensor gdS8 = mdS8(_, _, n_block, m_block, fq8_bh);
                         auto blk_tma_dS8 = params.tma_store_dS8.get_slice(_0{});
                         Tensor tdS8s = blk_tma_dS8.partition_S(sdS(_, _, _0{}));
-                        Tensor tdS8g = blk_tma_dS8.partition_D(gdS8);
-                        cute::copy(params.tma_store_dS8, tdS8s, tdS8g);
+                        if constexpr (Varlen) {
+                            int32_t const fq8_tile_idx = int32_t(fq8_tile_base_seq + int64_t(m_block) * fq8_nbn_seq + n_block);
+                            Tensor mdS8 = params.tma_store_dS8.get_tma_tensor(
+                                make_shape(Int<kBlockM>{}, Int<kBlockN>{}, fq8_total_tiles_ds8));
+                            Tensor gdS8 = mdS8(_, _, fq8_tile_idx);
+                            Tensor tdS8g = blk_tma_dS8.partition_D(gdS8);
+                            cute::copy(params.tma_store_dS8, tdS8s, tdS8g);
+                        } else {
+                            Tensor mdS8 = params.tma_store_dS8.get_tma_tensor(
+                                make_shape(Int<kBlockM>{}, Int<kBlockN>{}, params.nbn, params.nbm,
+                                           params.num_batch * get<2>(params.shape_Q)));
+                            Tensor gdS8 = mdS8(_, _, n_block, m_block, fq8_bh);
+                            Tensor tdS8g = blk_tma_dS8.partition_D(gdS8);
+                            cute::copy(params.tma_store_dS8, tdS8s, tdS8g);
+                        }
                         cute::tma_store_arrive();
                     }
                     // ## FP11-M4: in-window dV rescale = the v10 sequence
@@ -2370,8 +2445,10 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
                 float const fq8_psi = fmaxf(fq8_psi_raw, fq8_g_max * (256.0f * 1e-8f) / fq8_q8sc);
                 float const fq8_psi_inv = fq8_tile_zero ? 0.0f : 1.0f / fq8_psi;
                 if (thread_idx == 0) {
-                    params.ptr_psi[(int64_t(fq8_bh) * params.nbm + m64) * params.nbn + n_block]
-                        = fq8_tile_zero ? 0.0f : fq8_psi;
+                    int64_t const fq8_tile_idx = Varlen
+                        ? (fq8_tile_base_seq + int64_t(m64) * fq8_nbn_seq + n_block)
+                        : ((int64_t(fq8_bh) * params.nbm + m64) * params.nbn + n_block);
+                    params.ptr_psi[fq8_tile_idx] = fq8_tile_zero ? 0.0f : fq8_psi;
                 }
                 Tensor rP = make_tensor_like<Element>(tSrS);
                 flash::convert_type_out(tSrS, rP);
@@ -2408,14 +2485,23 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
                 cutlass::arch::fence_view_async_shared();
                 cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(BwdNamedBarriers::PdS) /*id*/);
                 if (thread_idx == 0) {
-                    Tensor mdS8 = params.tma_store_dS8.get_tma_tensor(
-                        make_shape(Int<kBlockMh>{}, Int<kBlockN>{}, params.nbn, params.nbm,
-                                   params.num_batch * get<2>(params.shape_Q)));
-                    Tensor gdS8 = mdS8(_, _, n_block, m64, fq8_bh);
                     auto blk_tma_dS8 = params.tma_store_dS8.get_slice(_0{});
                     Tensor tdS8s = blk_tma_dS8.partition_S(sdS(_, _, _0{}));
-                    Tensor tdS8g = blk_tma_dS8.partition_D(gdS8);
-                    cute::copy(params.tma_store_dS8, tdS8s, tdS8g);
+                    if constexpr (Varlen) {
+                        int32_t const fq8_tile_idx = int32_t(fq8_tile_base_seq + int64_t(m64) * fq8_nbn_seq + n_block);
+                        Tensor mdS8 = params.tma_store_dS8.get_tma_tensor(
+                            make_shape(Int<kBlockMh>{}, Int<kBlockN>{}, fq8_total_tiles_ds8));
+                        Tensor gdS8 = mdS8(_, _, fq8_tile_idx);
+                        Tensor tdS8g = blk_tma_dS8.partition_D(gdS8);
+                        cute::copy(params.tma_store_dS8, tdS8s, tdS8g);
+                    } else {
+                        Tensor mdS8 = params.tma_store_dS8.get_tma_tensor(
+                            make_shape(Int<kBlockMh>{}, Int<kBlockN>{}, params.nbn, params.nbm,
+                                       params.num_batch * get<2>(params.shape_Q)));
+                        Tensor gdS8 = mdS8(_, _, n_block, m64, fq8_bh);
+                        Tensor tdS8g = blk_tma_dS8.partition_D(gdS8);
+                        cute::copy(params.tma_store_dS8, tdS8s, tdS8g);
+                    }
                     cute::tma_store_arrive();
                 }
                 // the dV window rescale exactly where (and as often as) P1-A applies it: once per 64-row tile, right before

@@ -942,7 +942,9 @@ struct CollectiveMainloopFwdSm90Fp8F {
                 copy(params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
                     tKgK_TMA(_, n_block_idx, bidb_kv_idx), tKsK_TMA(_, smem_pipe_write.index()));
                 if constexpr (kSmemSc) {
-                    int const sc_off = (bidb * get<2>(params.shape_K) + params.qhead_per_khead_divmod.divide(bidh)) * params.nblk_k + (kGroups == 4 ? 4 * n_block : 4 * (n_block >> 1));
+                    int const sc_off = ((!is_varlen_k ? bidb : 0) * get<2>(params.shape_K) + bidh_kv) * params.nblk_k
+                        + (is_varlen_k ? seqlen_info.offset_k / kQuantKeys : 0)
+                        + (kGroups == 4 ? 4 * n_block : 4 * (n_block >> 1));
                     float* sc_dst = shared_storage.tensors.mainloop.smem_kvsc.data() + 8 * smem_pipe_write.index();
                     cute::SM90_BULK_COPY_G2S::copy(params.ptr_k8s + sc_off, pipeline_k.producer_get_barrier(smem_pipe_write), sc_dst, 16);
                     cute::SM90_BULK_COPY_G2S::copy(params.ptr_v8s + sc_off, pipeline_k.producer_get_barrier(smem_pipe_write), sc_dst + 4, 16);
@@ -1354,16 +1356,20 @@ struct CollectiveMainloopFwdSm90Fp8F {
         // per-32-row blocks, four per kBlockN=128 tile.  In the rowcol fragment
         // view the column group is exactly ni >> 3 (the within-thread low bits
         // never cross a 32-column boundary).
-        int const fq8_bh = bidb * get<2>(params.shape_Q) + bidh;
+        bool const is_varlen_q = Varlen && params.cu_seqlens_q;
+        bool const is_varlen_k = Varlen && params.cu_seqlens_k;
+        int const fq8_bh = (!is_varlen_q ? bidb : 0) * get<2>(params.shape_Q) + bidh;
+        int const fq8_qblk_off = is_varlen_q ? (seqlen_info.offset_q / kQuantRowsQ) : 0;
         // ## Delta-Matching-128: one Q scale per 128-row m-block (both WGs); d256 keeps the per-WG 64-row block.
         float const fq8_q8sc = kQuantRowsQ == 64
-            ? params.ptr_q8s[fq8_bh * params.nblk_q + 2 * m_block + warp_group_idx]
-            : params.ptr_q8s[fq8_bh * params.nblk_q + (kBlockM % kQuantRowsQ == 0 ? m_block
-                  : min((m_block * kBlockM + warp_group_idx * 64) / kQuantRowsQ, params.nblk_q - 1))];   // per-WG block
+            ? params.ptr_q8s[fq8_bh * params.nblk_q + fq8_qblk_off + 2 * m_block + warp_group_idx]
+            : params.ptr_q8s[fq8_bh * params.nblk_q + (kBlockM % kQuantRowsQ == 0 ? (fq8_qblk_off + m_block)
+                  : min(fq8_qblk_off + (m_block * kBlockM + warp_group_idx * 64) / kQuantRowsQ, params.nblk_q - 1))];   // per-WG block
         // ## FP11-M16 (native GQA, READ side): k8s/v8s are per KV head
         // (b, h_k, nblk_k), matching the K/V TMA tensors (bidh_kv).  h_k == h
         // reproduces the M10 index arithmetic exactly.
-        int const fq8_bh_k = (bidb * get<2>(params.shape_K) + bidh_kv) * params.nblk_k;
+        int const fq8_bh_k = ((!is_varlen_k ? bidb : 0) * get<2>(params.shape_K) + bidh_kv) * params.nblk_k
+            + (is_varlen_k ? seqlen_info.offset_k / kQuantKeys : 0);
         float fq8_v[4] = {1.f, 1.f, 1.f, 1.f};
         float fq8_ksc[4] = {1.f, 1.f, 1.f, 1.f}, fq8_vsc[4] = {1.f, 1.f, 1.f, 1.f};   // from smem after the K wait
         auto fq8_read_sc = [&](int stage, int n_blk) {
@@ -1437,6 +1443,17 @@ struct CollectiveMainloopFwdSm90Fp8F {
             } else {
             fq8_v[0] = params.ptr_v8s[fq8_bh_k + 2 * n_blk + 0];
             fq8_v[1] = params.ptr_v8s[fq8_bh_k + 2 * n_blk + 1];
+            }
+            if constexpr (Varlen) {
+                // Completely padded tail groups (all keys >= seqlen_k) have V=0, P=0 and
+                // floor scale 1e-30/448; carrying the previous group's scale avoids
+                // 1e30 clamping in fq8_rho and denormal underflow in promote_o.
+                #pragma unroll
+                for (int g = 1; g < kGroups; ++g) {
+                    if ((n_blk * kGroups + g) * kQuantKeys >= seqlen_k) {
+                        fq8_v[g] = fq8_v[g - 1];
+                    }
+                }
             }
         };
         // ## FQ8F: the within-tile basis ratio rho_g = w_{g-1}/w_g, per row.

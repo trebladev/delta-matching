@@ -5,5 +5,7 @@
 
 template void run_flash_delta_fp11_d256<true>(Flash_bwd_fp8_params &params, cudaStream_t stream);
 template void run_flash_delta_fp11_d256<false>(Flash_bwd_fp8_params &params, cudaStream_t stream);
+template void run_flash_delta_fp11_varlen_d256<true>(Flash_bwd_fp8_params &params, cudaStream_t stream);
+template void run_flash_delta_fp11_varlen_d256<false>(Flash_bwd_fp8_params &params, cudaStream_t stream);
 
 // The head_dim-128 pass 0 is compiled in its own TU (flash_delta_hdim128_e4m3_fp11v5_sm90.cu).

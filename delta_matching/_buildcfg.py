@@ -37,6 +37,7 @@ BF16_DP = os.environ.get("DM_BF16_DP", "0") == "1"
 # header in the device code of the library, and no compiler option remaps those.  The generated SASS is unchanged
 # either way (line tables are metadata), so the shipped numerics do not depend on it.
 LINEINFO = os.environ.get("DM_LINEINFO", "0") == "1"
+VARLEN = True
 
 # the certified flag set (the build of the certified binaries)
 FLAGS = {
@@ -59,7 +60,7 @@ EXTRA_DEFINES = ["-DFA3FP11_M16_P0V2_ATOMN=64", "-DFA3FP11_HD128_P0V6=1", "-DFA3
 def defines():
     d = ["-DFLASHATTENTION_DISABLE_SM8x", "-DFLASHATTENTION_DISABLE_SPLIT", "-DFLASHATTENTION_DISABLE_PAGEDKV",
          "-DFLASHATTENTION_DISABLE_APPENDKV", "-DFLASHATTENTION_DISABLE_LOCAL", "-DFLASHATTENTION_DISABLE_SOFTCAP",
-         "-DFLASHATTENTION_DISABLE_PACKGQA", "-DFLASHATTENTION_DISABLE_FP16", "-DFLASHATTENTION_DISABLE_VARLEN",
+         "-DFLASHATTENTION_DISABLE_PACKGQA", "-DFLASHATTENTION_DISABLE_FP16",
          "-DFLASHATTENTION_DISABLE_CLUSTER", "-DFLASHATTENTION_DISABLE_HDIM64", "-DFLASHATTENTION_DISABLE_HDIM96",
          "-DFLASHATTENTION_DISABLE_HDIM128", "-DFLASHATTENTION_DISABLE_HDIM192", "-DFLASHATTENTION_DISABLE_HDIMDIFF64",
          "-DFLASHATTENTION_DISABLE_HDIMDIFF192",
@@ -67,6 +68,8 @@ def defines():
          "-DFA3FP8F_PHAT_FLOOR_B=12", "-DFA3FP8F_TP_GPP=4", "-DFA3FP8F_TP_NSPLIT=2", "-DFA3FP8F_TP_PVFIRST=1"]
     if DBG:
         d.append("-DFA3FP11_DBG")
+    if not VARLEN:
+        d.append("-DFLASHATTENTION_DISABLE_VARLEN")
     d += [f"-D{k}={v}" for k, v in FLAGS.items()]
     d += EXTRA_DEFINES
     return d
@@ -118,11 +121,11 @@ def _prefix_maps():
 
 def cxx_flags():
     """The host compiler flags (the api .cpp under setup.py, extra_cflags under the JIT build)."""
-    return ["-O3", "-std=c++17"] + _prefix_maps()
+    return ["-O3", "-std=c++20"] + _prefix_maps()
 
 
 def cuda_flags():
-    f = ["-O3", "-std=c++17", "--use_fast_math", "-DNDEBUG", "--expt-relaxed-constexpr",
+    f = ["-O3", "-std=c++20", "--use_fast_math", "-DNDEBUG", "--expt-relaxed-constexpr",
          "--expt-extended-lambda", "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED", "-DCUTLASS_ENABLE_GDC_FOR_SM90",
          "-DCUTLASS_DEBUG_TRACE_LEVEL=0", "--threads", "4", "-gencode", "arch=compute_90a,code=sm_90a"]
     if LINEINFO:
@@ -162,7 +165,7 @@ def csrc_sha():
 
 def write_build_info():
     """Stamp this build into the package (read by delta_matching.kernel_version()); rewritten by every build."""
-    info = {"code_sha": csrc_sha(), "dbg": DBG, "bf16_dp": BF16_DP, "lineinfo": LINEINFO, "flags": FLAGS,
+    info = {"code_sha": csrc_sha(), "dbg": DBG, "bf16_dp": BF16_DP, "lineinfo": LINEINFO, "varlen": VARLEN, "flags": FLAGS,
             "extra_defines": EXTRA_DEFINES}
     with open(os.path.join(PACKAGE_DIR, "_build_info.py"), "w") as f:
         f.write("# written by the build (setup.py / delta_matching.jit); not hand-edited\n")

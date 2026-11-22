@@ -93,6 +93,7 @@
 #include <cutlass/gemm/collective/builders/sm90_common.inl>
 
 #include "utils.h"
+#include "dm_varlen_scheduler.hpp"
 
 namespace fq8p2h128 {
 
@@ -398,6 +399,176 @@ fq8_dq_pass2_kernel_hd128(CUTE_GRID_CONSTANT P2Params const params) {
     }
 }
 
+using ShapeA_Varlen = cute::Shape<Int<kBM>, Int<kBK>, int32_t>;
+using StrideA_Varlen = cute::Stride<Int<kBK>, _1, int64_t>;
+using TmaA_Varlen = decltype(make_tma_copy(
+    cute::SM90_TMA_LOAD{},
+    make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeA_Varlen{}, StrideA_Varlen{}),
+    SmemLayoutA{}(_, _, _0{})));
+
+struct P2VarlenParams {
+    TmaA_Varlen tma_a;
+    TmaB tma_b;
+    ShapeA_Varlen shape_a;
+    ShapeB shape_b;
+    float const* ptr_psi;
+    void* dq_ptr;
+    int64_t dq_row_stride, dq_head_stride;
+    float final_scale;
+    int h, h_k, num_seqs;
+    int const* cu_seqlens_padded;
+    int const* seqlens_actual;
+    int64_t const* cu_padded_sq;
+    int64_t total_tiles_per_head;
+};
+
+template <bool Is_causal>
+__global__ void __launch_bounds__(128, 1)
+fq8_dq_pass2_varlen_kernel_hd128(CUTE_GRID_CONSTANT P2VarlenParams const params) {
+    extern __shared__ char smem_raw[];
+    auto& shared = *reinterpret_cast<SharedStorage*>(smem_raw);
+    int const global_mb = blockIdx.x;
+    int const h_idx = blockIdx.y;
+    int const tid = threadIdx.x;
+
+    int const seq_idx = flash::dm_varlen_locate_seq(params.cu_seqlens_padded, params.num_seqs, global_mb * kBM);
+    int const offset_seq = params.cu_seqlens_padded[seq_idx];
+    int const padded_len = params.cu_seqlens_padded[seq_idx + 1] - offset_seq;
+    int const actual_len = params.seqlens_actual[seq_idx];
+    int const mb = global_mb - offset_seq / kBM;
+
+    auto* dq_base = reinterpret_cast<cutlass::bfloat16_t*>(params.dq_ptr)
+        + int64_t(h_idx) * params.dq_head_stride
+        + int64_t(offset_seq + mb * kBM) * params.dq_row_stride;
+
+    if (mb * kBM >= actual_len) {
+        for (int idx = tid; idx < (kBM * kBD) / 2; idx += 128) {
+            int const m = idx / (kBD / 2);
+            int const d = (idx % (kBD / 2)) * 2;
+            *reinterpret_cast<uint32_t*>(dq_base + int64_t(m) * params.dq_row_stride + d) = 0u;
+        }
+        return;
+    }
+
+    int const nbn_seq = padded_len / kBK;
+    int const nbn_actual = (actual_len + kBK - 1) / kBK;
+    int const nb_end = Is_causal ? min(((mb + 1) * kBM - 1) / kBK + 1, nbn_actual) : nbn_actual;
+    int64_t const tile_row_base = int64_t(h_idx) * params.total_tiles_per_head
+        + params.cu_padded_sq[seq_idx] / (int64_t(kBM) * kBK)
+        + int64_t(mb) * nbn_seq;
+    int const k_tile_base = offset_seq / kBK;
+
+    if (tid == 0) {
+        #pragma unroll
+        for (int s = 0; s < kStages; ++s) { shared.full_bar[s].init(1); }
+    }
+    cutlass::arch::fence_barrier_init();
+    __syncthreads();
+
+    Tensor sA = make_tensor(make_smem_ptr(shared.smem_a.data()), SmemLayoutA{});
+    Tensor sB = make_tensor(make_smem_ptr(shared.smem_b.data()), SmemLayoutB{});
+    Tensor mA = params.tma_a.get_tma_tensor(params.shape_a);
+    Tensor mB = params.tma_b.get_tma_tensor(params.shape_b);
+    int const h_kv = h_idx / (params.h / params.h_k);
+    Tensor gB = flat_divide(mB(_, _, h_kv), Shape<Int<kBD>, Int<kBK>>{})(_, _, _0{}, _);
+    auto blkA = params.tma_a.get_slice(_0{});
+    auto blkB = params.tma_b.get_slice(_0{});
+    Tensor tAgA = group_modes<0, 3>(blkA.partition_S(mA));
+    Tensor tAsA = group_modes<0, 3>(blkA.partition_D(sA));
+    Tensor tBgB = group_modes<0, 3>(blkB.partition_S(gB));
+    Tensor tBsB = group_modes<0, 3>(blkB.partition_D(sB));
+
+    TiledMmaP2 tiled_mma;
+    auto wg_mma = tiled_mma.get_thread_slice(tid);
+    Tensor tCrA = wg_mma.partition_fragment_A(sA);
+    Tensor tCrB = wg_mma.partition_fragment_B(sB);
+    Tensor acc = partition_fragment_C(tiled_mma, select<0, 1>(TileShapeMNK{}));
+    clear(acc);
+
+    Tensor cC = cute::make_identity_tensor(make_shape(Int<kBM>{}, Int<kBD>{}));
+    Tensor tCcC = wg_mma.partition_C(cC);
+    float* const smem_dq = shared.smem_dq.data();
+
+    #pragma unroll
+    for (int i = 0; i < size(acc); i += 2) {
+        int const m = get<0>(tCcC(i));
+        int const d = get<1>(tCcC(i));
+        *reinterpret_cast<float2*>(&smem_dq[m * kDqPitch + d]) = make_float2(0.0f, 0.0f);
+    }
+
+    auto issue = [&](int tile) {
+        if (tid == 0) {
+            int const s = tile % kStages;
+            shared.full_bar[s].arrive_and_expect_tx(kTxBytes);
+            auto& bar = reinterpret_cast<uint64_t&>(shared.full_bar[s]);
+            copy(params.tma_a.with(bar, 0 /*mcast*/), tAgA(_, int32_t(tile_row_base + tile)), tAsA(_, s));
+            copy(params.tma_b.with(bar, 0 /*mcast*/), tBgB(_, k_tile_base + tile), tBsB(_, s));
+        }
+    };
+    #pragma unroll 1
+    for (int t = 0; t < (kStages < nb_end ? kStages : nb_end); ++t) { issue(t); }
+
+    float const* psi_row = params.ptr_psi + tile_row_base;
+    float psi_w = 0.0f;
+    float psi_max = 0.0f;
+    float psi_pf = nb_end > 0 ? psi_row[0] : 0.0f;
+    #pragma unroll 1
+    for (int nb = 0; nb < nb_end; ++nb) {
+        int const s = nb % kStages;
+        float const psi_cur = psi_pf;
+        if (nb + 1 < nb_end) { psi_pf = psi_row[nb + 1]; }
+        shared.full_bar[s].wait((nb / kStages) & 1);
+        if (psi_cur != 0.0f && !(psi_cur < psi_max * 1e-8f)) {
+            if (psi_w != 0.0f) {
+                float ratio = psi_w / psi_cur;
+                ratio = fminf(fmaxf(ratio, 1e-8f), 1e8f);
+                #pragma unroll
+                for (int i = 0; i < size(acc); ++i) { acc(i) *= ratio; }
+                flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(
+                    tiled_mma, tCrA(_, _, _, s), tCrB(_, _, _, s), acc);
+            } else {
+                flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(
+                    tiled_mma, tCrA(_, _, _, s), tCrB(_, _, _, s), acc);
+            }
+            psi_w = psi_cur;
+            psi_max = fmaxf(psi_max, psi_cur);
+        }
+        __syncthreads();
+        int const nxt = nb + kStages;
+        if (nxt < nb_end) { issue(nxt); }
+        if ((nb & (kPromoteTiles - 1)) == kPromoteTiles - 1 || nb == nb_end - 1) {
+            if (psi_w != 0.0f) {
+                #pragma unroll
+                for (int i = 0; i < size(acc); i += 2) {
+                    int const m = get<0>(tCcC(i));
+                    int const d = get<1>(tCcC(i));
+                    float2* const slot = reinterpret_cast<float2*>(&smem_dq[m * kDqPitch + d]);
+                    float2 v2 = *slot;
+                    v2.x = fmaf(acc(i), psi_w, v2.x);
+                    v2.y = fmaf(acc(i + 1), psi_w, v2.y);
+                    *slot = v2;
+                }
+                psi_w = 0.0f;
+            }
+        }
+    }
+
+    float const fin = params.final_scale;
+    #pragma unroll
+    for (int i = 0; i < size(acc); i += 2) {
+        int const m = get<0>(tCcC(i));
+        int const d = get<1>(tCcC(i));
+        uint32_t pack = 0u;
+        if (mb * kBM + m < actual_len) {
+            float2 const v2 = *reinterpret_cast<float2 const*>(&smem_dq[m * kDqPitch + d]);
+            cutlass::bfloat16_t lo(v2.x * fin), hi(v2.y * fin);
+            pack = (uint32_t(reinterpret_cast<uint16_t const&>(hi)) << 16)
+                 | uint32_t(reinterpret_cast<uint16_t const&>(lo));
+        }
+        *reinterpret_cast<uint32_t*>(dq_base + int64_t(m) * params.dq_row_stride + d) = pack;
+    }
+}
+
 }  // namespace fq8p2h128
 
 // ## FP11 (M2): v11-specific symbol (the parent's run_fq8_dq_pass2 is a weak
@@ -439,4 +610,37 @@ void run_fq8_dq_pass2_fp11_d128(Flash_bwd_fp8_params &params, cudaStream_t strea
     dim3 grid(nbm, bh, 1);
     kernel<<<grid, 128, kSmem, stream>>>(p2);
     { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess) { fprintf(stderr, "[delta_matching pass 2 hd128] launch: %s\n", cudaGetErrorString(e_)); exit(1); } }
+}
+
+template <bool Is_causal>
+void run_fq8_dq_pass2_fp11_varlen_d128(Flash_bwd_fp8_params &params, cudaStream_t stream) {
+    using namespace fq8p2h128;
+    int const total_padded = params.total_q;
+    if (total_padded <= 0 || params.b <= 0 || params.total_padded_sq <= 0) { return; }
+    int const total_mb = total_padded / kBM;
+    int64_t const total_tiles_per_head = params.total_padded_sq / (int64_t(kBM) * kBK);
+    int32_t const total_tiles = int32_t(int64_t(params.h) * total_tiles_per_head);
+    ShapeA_Varlen shape_a = make_shape(Int<kBM>{}, Int<kBK>{}, total_tiles);
+    StrideA_Varlen stride_a = make_stride(Int<kBK>{}, _1{}, int64_t(kBM) * kBK);
+    Tensor mA = make_tensor(make_gmem_ptr(static_cast<Element const*>(params.ds8_ptr)),
+                            shape_a, stride_a);
+    TmaA_Varlen tma_a = make_tma_copy(cute::SM90_TMA_LOAD{}, mA, SmemLayoutA{}(_, _, _0{}));
+    ShapeB shape_b = make_shape(Int<kBD>{}, total_padded, params.h_k);
+    StrideB stride_b = make_stride(int64_t(total_padded), _1{}, int64_t(kBD) * total_padded);
+    Tensor mB = make_tensor(make_gmem_ptr(static_cast<Element const*>(params.kt_ptr)),
+                            shape_b, stride_b);
+    TmaB tma_b = make_tma_copy(cute::SM90_TMA_LOAD{}, mB, SmemLayoutB{}(_, _, _0{}));
+    P2VarlenParams p2{tma_a, tma_b, shape_a, shape_b, params.psi_ptr,
+                      params.dq_ptr, params.dq_row_stride, params.dq_head_stride,
+                      params.scale_softmax / 256.0f, params.h, params.h_k, params.b,
+                      params.cu_seqlens_q, params.seqused_q, params.cu_padded_sq,
+                      total_tiles_per_head};
+    auto* kernel = &fq8p2h128::fq8_dq_pass2_varlen_kernel_hd128<Is_causal>;
+    constexpr int kSmem = int(sizeof(SharedStorage));
+    if (kSmem >= 48 * 1024) {
+        CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+    }
+    dim3 grid(total_mb, params.h, 1);
+    kernel<<<grid, 128, kSmem, stream>>>(p2);
+    CHECK_CUDA_KERNEL_LAUNCH();
 }

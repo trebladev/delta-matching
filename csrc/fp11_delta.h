@@ -110,10 +110,58 @@ fp11_delta_reduce_kernel(float const* __restrict__ part, float* __restrict__ dlt
     dlt[int64_t(bh) * seqlen_q + i] = float(acc);
 }
 
+__global__ void __launch_bounds__(64, 1)
+fp11_delta_reduce_varlen_kernel(
+    float const* __restrict__ part,
+    float* __restrict__ dlt,
+    int const* __restrict__ cu_seqlens_padded,
+    int const* __restrict__ seqlens_actual,
+    int64_t const* __restrict__ cu_padded_sq,
+    int64_t total_padded_sq,
+    int num_seqs,
+    int total_padded,
+    bool is_causal
+) {
+    int const mb_global = blockIdx.x;
+    int const bidh = blockIdx.y;
+    int const pos = mb_global * 64;
+    int const global_i = pos + threadIdx.x;
+    if (global_i >= total_padded) { return; }
+    int lo = 0, hi = num_seqs;
+    while (lo + 1 < hi) {
+        int const mid = (lo + hi) >> 1;
+        if (cu_seqlens_padded[mid] <= pos) { lo = mid; } else { hi = mid; }
+    }
+    int const offset_seq = cu_seqlens_padded[lo];
+    int const padded_len = cu_seqlens_padded[lo + 1] - offset_seq;
+    int const actual_len = seqlens_actual[lo];
+    int const local_i = global_i - offset_seq;
+    if (local_i >= actual_len) {
+        dlt[int64_t(bidh) * total_padded + global_i] = 0.0f;
+        return;
+    }
+    int const mb_local = (pos - offset_seq) / 64;
+    int const nbn_actual = (actual_len + 63) / 64;
+    int const jn = is_causal ? (mb_local + 1 < nbn_actual ? mb_local + 1 : nbn_actual) : nbn_actual;
+    float const* col = part + (int64_t(bidh) * total_padded_sq + cu_padded_sq[lo]) / 32 + local_i;
+    double acc = 0.0;
+    #pragma unroll 4
+    for (int j = 0; j < jn; ++j) {
+        acc += double(col[int64_t(2 * j) * padded_len]);
+        acc += double(col[int64_t(2 * j + 1) * padded_len]);
+    }
+    dlt[int64_t(bidh) * total_padded + global_i] = float(acc);
+}
+
 }  // namespace fp11d
 
 #include "fp11_delta_v3.h"   // ## FP11-M16 lever G: 256 keys per CTA, two n-blocks per warpgroup (takes precedence over P0V2)
 #include "fp11_delta_v4.h"   // ## FP11-M17 T2a: v3 with the wgmma issue software-pipelined across stages (precedence over P0V3)
+
+template <bool Is_causal>
+void run_flash_delta_fp11_varlen_d256(Flash_bwd_fp8_params &params, cudaStream_t stream) {
+    run_flash_delta_v4_fp11_varlen_d256<Is_causal>(params, stream);
+}
 
 // ## FP11-M5: v11-specific symbol (same no-weak-overlap rationale as
 // run_flash_bwd_fp11_d256).  Launches pass 0 then the reduce, stream-ordered.

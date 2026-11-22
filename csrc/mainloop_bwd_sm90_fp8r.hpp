@@ -102,7 +102,7 @@ namespace flash {
 
 using namespace cute;
 
-template <int Stages, int Stages_dO, int Stages_dOt, bool Is_causal_>
+template <int Stages, int Stages_dO, int Stages_dOt, bool Is_causal_, bool Varlen_ = false>
 struct CollectiveMainloopBwdSm90Fp8R {
     using Element = cutlass::float_e4m3_t;
     // ## bf16-dP: SageBwd's single exemption. dP = dO V^T is computed in bf16 from the RAW
@@ -136,7 +136,7 @@ struct CollectiveMainloopBwdSm90Fp8R {
     static constexpr bool Is_causal = Is_causal_;
     static constexpr bool Is_local = false;
     static constexpr bool Has_softcap = false;
-    static constexpr bool Varlen = false;
+    static constexpr bool Varlen = Varlen_;
     static constexpr bool DeltaPass0 = false;
     static constexpr int kAbl = 0;
     static constexpr bool Q_dO_same_stages = kStages == kStages_dO;
@@ -240,9 +240,13 @@ struct CollectiveMainloopBwdSm90Fp8R {
         cute::SM90_TMA_LOAD{},
         make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeQKV{}, StrideQKV{}),
         take<0, 2>(SmemLayoutdOt{}), TileShape_TwinM{}, ClusterShape{}));
-    // The dS' tile store: [BH, nbm, nbn, 64, 128] gmem (tile-contiguous), one (64 x 64) box per warpgroup.
-    using ShapeDS8 = cute::Shape<Int<kBlockM>, Int<kBlockN>, int32_t, int32_t, int32_t>;
-    using StrideDS8 = cute::Stride<Int<kBlockN>, _1, int64_t, int64_t, int64_t>;
+    // The dS' tile store: [BH, nbm, nbn, 64, 128] gmem (dense) or [total_tiles, 64, 128] (varlen), one (64 x 64) box per warpgroup.
+    using ShapeDS8 = std::conditional_t<Varlen,
+        cute::Shape<Int<kBlockM>, Int<kBlockN>, int32_t>,
+        cute::Shape<Int<kBlockM>, Int<kBlockN>, int32_t, int32_t, int32_t>>;
+    using StrideDS8 = std::conditional_t<Varlen,
+        cute::Stride<Int<kBlockN>, _1, int64_t>,
+        cute::Stride<Int<kBlockN>, _1, int64_t, int64_t, int64_t>>;
     using TMA_dS8 = decltype(make_tma_copy(
         cute::SM90_TMA_STORE{},
         make_tensor(make_gmem_ptr(static_cast<Element*>(nullptr)), ShapeDS8{}, StrideDS8{}),
@@ -342,6 +346,8 @@ struct CollectiveMainloopBwdSm90Fp8R {
         float* const ptr_dbg_rows;
         float* const ptr_dbg_rowsabs;
         unsigned int* const ptr_dbg_cks;
+        int64_t const* const cu_padded_sq = nullptr;
+        int64_t const total_padded_sq = 0;
     };
 
     struct Params {
@@ -375,6 +381,8 @@ struct CollectiveMainloopBwdSm90Fp8R {
         int const* const cu_seqlens_k;
         int const* const seqused_q;
         int const* const seqused_k;
+        int64_t const* const cu_padded_sq;
+        int64_t const total_padded_sq;
         TMA_dS8 tma_store_dS8;
         float* const ptr_psi;
         int const nbm;
@@ -398,12 +406,22 @@ struct CollectiveMainloopBwdSm90Fp8R {
         TMA_Qt tma_load_Qt = make_tma_copy_A_sm90(cute::SM90_TMA_LOAD{}, mQt, take<0, 2>(SmemLayoutQt{}), TileShape_TwinM{}, ClusterShape{});
         Tensor mdOt = make_tensor(make_gmem_ptr(args.ptr_dOt), args.shape_dOt, args.stride_dOt);
         TMA_dOt tma_load_dOt = make_tma_copy_A_sm90(cute::SM90_TMA_LOAD{}, mdOt, take<0, 2>(SmemLayoutdOt{}), TileShape_TwinM{}, ClusterShape{});
-        Tensor mDS8 = make_tensor(make_gmem_ptr(args.ptr_dS8),
-            make_shape(Int<kBlockM>{}, Int<kBlockN>{}, args.nbn, args.nbm, args.num_batch * get<2>(args.shape_Q)),
-            make_stride(Int<kBlockN>{}, _1{}, int64_t(kBlockM) * kBlockN,
-                        int64_t(kBlockM) * kBlockN * args.nbn,
-                        int64_t(kBlockM) * kBlockN * args.nbn * args.nbm));
-        TMA_dS8 tma_store_dS8 = make_tma_copy(cute::SM90_TMA_STORE{}, mDS8, SmemLayoutDS{});
+        TMA_dS8 tma_store_dS8 = [&] {
+            if constexpr (Varlen) {
+                int32_t const total_tiles = int32_t((int64_t(get<2>(args.shape_Q)) * args.total_padded_sq) / (int64_t(kBlockM) * kBlockN));
+                Tensor mDS8 = make_tensor(make_gmem_ptr(args.ptr_dS8),
+                    make_shape(Int<kBlockM>{}, Int<kBlockN>{}, total_tiles),
+                    make_stride(Int<kBlockN>{}, _1{}, int64_t(kBlockM) * kBlockN));
+                return make_tma_copy(cute::SM90_TMA_STORE{}, mDS8, SmemLayoutDS{});
+            } else {
+                Tensor mDS8 = make_tensor(make_gmem_ptr(args.ptr_dS8),
+                    make_shape(Int<kBlockM>{}, Int<kBlockN>{}, args.nbn, args.nbm, args.num_batch * get<2>(args.shape_Q)),
+                    make_stride(Int<kBlockN>{}, _1{}, int64_t(kBlockM) * kBlockN,
+                                int64_t(kBlockM) * kBlockN * args.nbn,
+                                int64_t(kBlockM) * kBlockN * args.nbn * args.nbm));
+                return make_tma_copy(cute::SM90_TMA_STORE{}, mDS8, SmemLayoutDS{});
+            }
+        }();
         cutlass::FastDivmod attention_chunk_divmod(args.attention_chunk >= 1 ? args.attention_chunk : 1);
         attention_chunk_divmod.divisor = args.attention_chunk;
         return {args.shape_Q, args.shape_K, args.shape_V, args.shape_dO,
@@ -413,6 +431,7 @@ struct CollectiveMainloopBwdSm90Fp8R {
                 args.ptr_LSE_log2, args.shape_LSE, args.stride_LSE_log2, args.ptr_dPsum, args.stride_dPsum,
                 args.softmax_scale, args.window_size_left, args.window_size_right, attention_chunk_divmod,
                 args.num_batch, args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k,
+                args.cu_padded_sq, args.total_padded_sq,
                 tma_store_dS8, args.ptr_psi, args.nbm, args.nbn,
                 args.ptr_dbg_rows, args.ptr_dbg_rowsabs, args.ptr_dbg_cks};
     }
@@ -443,7 +462,7 @@ struct CollectiveMainloopBwdSm90Fp8R {
                                  params.cu_seqlens_q, params.cu_seqlens_k, params.seqused_q, params.seqused_k};
         auto [m_block_min, m_block_max] = BlockMN_t::get_m_block_min_max(
             seqlen_info, n_block, bidb, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/);
-        if constexpr (Is_causal) {
+        if constexpr (Is_causal || Varlen) {
             if (m_block_max <= m_block_min) { scheduler_prefetch(); return; }
         }
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
@@ -456,25 +475,28 @@ struct CollectiveMainloopBwdSm90Fp8R {
         Tensor sdOt = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_dot.data()), SmemLayoutdOt{});
 
         int bidh_kv = params.qhead_per_khead_divmod.divide(bidh);
-        Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh, bidb);
-        Tensor mdO = params.tma_load_dO.get_tma_tensor(params.shape_dO)(_, _, bidh, bidb);
-        Tensor mK = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, bidb);
-        Tensor mV = params.tma_load_V.get_tma_tensor(params.shape_V)(_, _, bidh_kv, bidb);
+        bool const is_varlen_q = Varlen && params.cu_seqlens_q;
+        bool const is_varlen_k = Varlen && params.cu_seqlens_k;
+        Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh, !is_varlen_q ? bidb : 0);
+        Tensor mdO = params.tma_load_dO.get_tma_tensor(params.shape_dO)(_, _, bidh, !is_varlen_q ? bidb : 0);
+        Tensor mK = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, !is_varlen_k ? bidb : 0);
+        Tensor mV = params.tma_load_V.get_tma_tensor(params.shape_V)(_, _, bidh_kv, !is_varlen_k ? bidb : 0);
         auto shape_Qt = make_shape(get<1>(params.shape_Q), get<0>(params.shape_Q), get<2>(params.shape_Q), get<3>(params.shape_Q));
         auto shape_dOt = make_shape(get<1>(params.shape_dO), get<0>(params.shape_dO), get<2>(params.shape_dO), get<3>(params.shape_dO));
-        Tensor mQt = params.tma_load_Qt.get_tma_tensor(shape_Qt)(_, _, bidh, bidb);
-        Tensor mdOt = params.tma_load_dOt.get_tma_tensor(shape_dOt)(_, _, bidh, bidb);
-        Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE_log2), params.shape_LSE, params.stride_LSE_log2)(_, bidh, bidb);
-        Tensor mdPsum = make_tensor(make_gmem_ptr(params.ptr_dPsum), params.shape_LSE, params.stride_dPsum)(_, bidh, bidb);
+        Tensor mQt = params.tma_load_Qt.get_tma_tensor(shape_Qt)(_, _, bidh, !is_varlen_q ? bidb : 0);
+        Tensor mdOt = params.tma_load_dOt.get_tma_tensor(shape_dOt)(_, _, bidh, !is_varlen_q ? bidb : 0);
+        Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE_log2), params.shape_LSE, params.stride_LSE_log2)(_, bidh, !is_varlen_q ? bidb : 0);
+        Tensor mdPsum = make_tensor(make_gmem_ptr(params.ptr_dPsum), params.shape_LSE, params.stride_dPsum)(_, bidh, !is_varlen_q ? bidb : 0);
 
         Tensor gQ = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));
         Tensor gdO = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mdO), select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));
         Tensor gK = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}), mK), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));
         Tensor gV = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}), mV), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));
-        Tensor gQt = local_tile(mQt, make_shape(Int<kHeadDim>{}, Int<kBlockM>{}), make_coord(_0{}, _));
-        Tensor gdOt = local_tile(mdOt, make_shape(Int<kHeadDim>{}, Int<kBlockM>{}), make_coord(_0{}, _));
-        Tensor gLSE = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded), mLSE), select<0>(TileShape_MNK{}), make_coord(_));
-        Tensor gdPsum = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded), mdPsum), select<0>(TileShape_MNK{}), make_coord(_));
+        Tensor gQt = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_q), mQt), make_shape(Int<kHeadDim>{}, Int<kBlockM>{}), make_coord(_0{}, _));
+        Tensor gdOt = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_q), mdOt), make_shape(Int<kHeadDim>{}, Int<kBlockM>{}), make_coord(_0{}, _));
+        int const lse_offset = Varlen ? seqlen_info.offset_q : seqlen_info.offset_q_padded;
+        Tensor gLSE = local_tile(domain_offset(make_coord(lse_offset), mLSE), select<0>(TileShape_MNK{}), make_coord(_));
+        Tensor gdPsum = local_tile(domain_offset(make_coord(lse_offset), mdPsum), select<0>(TileShape_MNK{}), make_coord(_));
 
         Tensor sK_x = make_tensor(sK.data(), make_layout(sK.layout(), Layout<_1>{}));
         Tensor gK_x = make_tensor(gK.data(), make_layout(gK.layout(), Layout<_1>{}));
@@ -586,7 +608,7 @@ struct CollectiveMainloopBwdSm90Fp8R {
                                  params.cu_seqlens_q, params.cu_seqlens_k, params.seqused_q, params.seqused_k};
         auto [m_block_min, m_block_max] = BlockMN_t::get_m_block_min_max(
             seqlen_info, n_block, bidb, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/);
-        if constexpr (Is_causal) {
+        if constexpr (Is_causal || Varlen) {
             if (m_block_max <= m_block_min) { return false; }
         }
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
@@ -649,12 +671,27 @@ struct CollectiveMainloopBwdSm90Fp8R {
         if (barrier_token == cutlass::BarrierStatus::WaitAgain) { shared_storage.pipelines.barrier_KV.wait(work_idx % 2); }
 
         // Scales: this WG's 64-key group (k8s / v8s), the Q / dO scale per 128 rows (m-block >> 1).
-        int const fq8_bh = bidb * get<2>(params.shape_Q) + bidh;
-        int const fq8_bh_kv = bidb * get<2>(params.shape_K) + params.qhead_per_khead_divmod.divide(bidh);
-        float const fq8_k8s_wg = params.ptr_k8s[fq8_bh_kv * params.nblk_k + 2 * n_block + warp_group_idx];
-        [[maybe_unused]] float const fq8_v8s_wg = params.ptr_v8s[fq8_bh_kv * params.nblk_k + 2 * n_block + warp_group_idx];   // dP descale; unread under bf16-dP
-        float const* fq8_q8s_base = params.ptr_q8s + fq8_bh * params.nblk_q;
-        float const* fq8_do8s_base = params.ptr_do8s + fq8_bh * params.nblk_q;
+        int const fq8_bh = Varlen ? bidh : (bidb * get<2>(params.shape_Q) + bidh);
+        int const fq8_bh_kv = Varlen
+            ? params.qhead_per_khead_divmod.divide(bidh)
+            : (bidb * get<2>(params.shape_K) + params.qhead_per_khead_divmod.divide(bidh));
+        int const fq8_k_blk_off = Varlen ? (seqlen_info.offset_k / kQuantKeys) : 0;
+        int const fq8_q_blk_off = Varlen ? (seqlen_info.offset_q / kQuantRowsQ) : 0;
+        float const fq8_k8s_wg = params.ptr_k8s[fq8_bh_kv * params.nblk_k + fq8_k_blk_off + 2 * n_block + warp_group_idx];
+        [[maybe_unused]] float const fq8_v8s_wg = params.ptr_v8s[fq8_bh_kv * params.nblk_k + fq8_k_blk_off + 2 * n_block + warp_group_idx];   // dP descale; unread under bf16-dP
+        float const* fq8_q8s_base = params.ptr_q8s + fq8_bh * params.nblk_q + fq8_q_blk_off;
+        float const* fq8_do8s_base = params.ptr_do8s + fq8_bh * params.nblk_q + fq8_q_blk_off;
+        int const fq8_padded_len_k = Varlen ? (params.cu_seqlens_k[bidb + 1] - params.cu_seqlens_k[bidb]) : 0;
+        int const fq8_nbn_seq = Varlen ? (fq8_padded_len_k / kBlockN) : params.nbn;
+        int64_t const fq8_total_tiles_per_head = Varlen ? (params.total_padded_sq / (int64_t(kBlockM) * kBlockN)) : 0;
+        int64_t const fq8_tile_base_seq = Varlen
+            ? (int64_t(bidh) * fq8_total_tiles_per_head + params.cu_padded_sq[bidb] / (int64_t(kBlockM) * kBlockN))
+            : 0;
+        int32_t const fq8_total_tiles_ds8 = Varlen
+            ? int32_t(int64_t(get<2>(params.shape_Q)) * fq8_total_tiles_per_head)
+            : 0;
+        Tensor tScS_fq8 = thread_mma_SdP.partition_C(cute::make_identity_tensor(select<1, 0>(TileShape_MNK{})));
+        Tensor tScS_rc = make_tensor(tScS_fq8.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SdP_swapAB>(tScS_fq8.layout()));
         auto fq8_qblk = [](int m) { return m >> kQShift; };
         float fq8_q8sc_next = fq8_q8s_base[fq8_qblk(m_block_min)];
         float fq8_do8sc_next = fq8_do8s_base[fq8_qblk(m_block_min)];
@@ -688,29 +725,27 @@ struct CollectiveMainloopBwdSm90Fp8R {
         uint32_t const fq8_st_addr1 = cute::cast_smem_ptr_to_uint(&sdS(32 + lane, 16 * warp_in_wg));
         uint32_t const fq8_st_addr0b = cute::cast_smem_ptr_to_uint(&sdS1(lane, 16 * warp_in_wg));
         uint32_t const fq8_st_addr1b = cute::cast_smem_ptr_to_uint(&sdS1(32 + lane, 16 * warp_in_wg));
-        Tensor mdS8 = params.tma_store_dS8.get_tma_tensor(
-            make_shape(Int<kBlockM>{}, Int<kBlockN>{}, params.nbn, params.nbm, params.num_batch * get<2>(params.shape_Q)));
         auto blk_tma_dS8 = params.tma_store_dS8.get_slice(_0{});
         Tensor tdS8s = blk_tma_dS8.partition_S(sdS);
         Tensor tdS8s1 = blk_tma_dS8.partition_S(sdS1);
-        // The WG's box store of tile m (buffer m & 1 under DSDEFER; the single buffer otherwise), issued by the elected thread.
-        auto fq8_issue_ds_store = [&](int m) {
-            Tensor gdS8 = mdS8(_, _, n_block, m, fq8_bh);
-            Tensor gdS8h = local_tile(gdS8, Shape<Int<kBlockM>, Int<kDsHalfN>>{}, make_coord(_0{}, warp_group_idx));
-            Tensor tdS8g = blk_tma_dS8.partition_D(gdS8h);
-            if (FA3FP11_P1R_DSDEFER && (m & 1)) { cute::copy(params.tma_store_dS8, tdS8s1, tdS8g); }
-            else { cute::copy(params.tma_store_dS8, tdS8s, tdS8g); }
-            cute::tma_store_arrive();
-        };
 
         // Deferred dS' stores: thread 0 of each warpgroup stores its half of tile m after the psi barrier of tile m + 1
         // (every thread has fenced its stmatrix of tile m by then).  Double-buffered by m parity.
         int const fq8_m_first = m_block;
         auto fq8_issue_ds_cta = [&](int m) {
-            Tensor gdS8 = mdS8(_, _, n_block, m, fq8_bh);
-            {   // this warpgroup's half only
-                int const w = warp_group_idx;
-                Tensor sbuf = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_ds.data() + (w * 2 + (m & 1)) * kDsHalfElems), SmemLayoutDS{});
+            int const w = warp_group_idx;
+            Tensor sbuf = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_ds.data() + (w * 2 + (m & 1)) * kDsHalfElems), SmemLayoutDS{});
+            if constexpr (Varlen) {
+                int32_t const fq8_tile_idx = int32_t(fq8_tile_base_seq + int64_t(m) * fq8_nbn_seq + n_block);
+                Tensor mdS8 = params.tma_store_dS8.get_tma_tensor(
+                    make_shape(Int<kBlockM>{}, Int<kBlockN>{}, fq8_total_tiles_ds8));
+                Tensor gdS8 = mdS8(_, _, fq8_tile_idx);
+                Tensor gdS8h = local_tile(gdS8, Shape<Int<kBlockM>, Int<kDsHalfN>>{}, make_coord(_0{}, w));
+                cute::copy(params.tma_store_dS8, blk_tma_dS8.partition_S(sbuf), blk_tma_dS8.partition_D(gdS8h));
+            } else {
+                Tensor mdS8 = params.tma_store_dS8.get_tma_tensor(
+                    make_shape(Int<kBlockM>{}, Int<kBlockN>{}, params.nbn, params.nbm, params.num_batch * get<2>(params.shape_Q)));
+                Tensor gdS8 = mdS8(_, _, n_block, m, fq8_bh);
                 Tensor gdS8h = local_tile(gdS8, Shape<Int<kBlockM>, Int<kDsHalfN>>{}, make_coord(_0{}, w));
                 cute::copy(params.tma_store_dS8, blk_tma_dS8.partition_S(sbuf), blk_tma_dS8.partition_D(gdS8h));
             }
@@ -795,6 +830,17 @@ struct CollectiveMainloopBwdSm90Fp8R {
                     }
                 }
             }
+            if constexpr (Varlen) {
+                if ((m_block + 1) * kBlockM > seqlen_q) {
+                    #pragma unroll
+                    for (int mi = 0; mi < size<0>(scores); ++mi) {
+                        if (m_block * kBlockM + get<1>(tScS_rc(mi, _0{})) >= seqlen_q) {
+                            #pragma unroll
+                            for (int ni = 0; ni < size<1>(scores); ++ni) { scores(mi, ni) = 0.0f; }
+                        }
+                    }
+                }
+            }
             // The stage's LSE rows were read by the loop above and the S gemm has retired: raw Q's readers are done.
             pipeline_q.consumer_release(smem_pipe_read);
             warpgroup_wait<0>();   // dP retired
@@ -853,9 +899,19 @@ struct CollectiveMainloopBwdSm90Fp8R {
                         sa += dbg_smem[(w * 2 + 0) * kBlockM + wg_thread];
                         sb += dbg_smem[(w * 2 + 1) * kBlockM + wg_thread];
                     }
-                    int64_t const gi = ((int64_t(fq8_bh) * params.nbn + n_block) * 2 + warp_group_idx) * int64_t(seqlen_q) + m_block * kBlockM + wg_thread;
-                    params.ptr_dbg_rows[gi] = sa;
-                    params.ptr_dbg_rowsabs[gi] = sb;
+                    int const fq8_r = m_block * kBlockM + wg_thread;
+                    if constexpr (Varlen) {
+                        if (fq8_r < seqlen_q) {
+                            int64_t const gi = (int64_t(bidh) * params.total_padded_sq + params.cu_padded_sq[bidb]) / 64
+                                + int64_t(n_block * 2 + warp_group_idx) * int64_t(fq8_padded_len_k) + fq8_r;
+                            params.ptr_dbg_rows[gi] = sa;
+                            params.ptr_dbg_rowsabs[gi] = sb;
+                        }
+                    } else {
+                        int64_t const gi = ((int64_t(fq8_bh) * params.nbn + n_block) * 2 + warp_group_idx) * int64_t(seqlen_q) + fq8_r;
+                        params.ptr_dbg_rows[gi] = sa;
+                        params.ptr_dbg_rowsabs[gi] = sb;
+                    }
                 }
                 cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, wg_barrier_id);
             }
@@ -867,6 +923,17 @@ struct CollectiveMainloopBwdSm90Fp8R {
                 for (int ni = 0; ni < size<1>(dS); ++ni) {
                     // dS' = 2^8 * P * (dP_true - delta) * k8s_wg (the k8s fold; P1-A's line, verbatim).
                     dS(mi, ni) = scores(mi, ni) * (dS(mi, ni) * fq8_dp_descale_f - dP_sum_cur_f);
+                }
+            }
+            if constexpr (Varlen) {
+                if ((m_block + 1) * kBlockM > seqlen_q) {
+                    #pragma unroll
+                    for (int mi = 0; mi < size<0>(dS); ++mi) {
+                        if (m_block * kBlockM + get<1>(tScS_rc(mi, _0{})) >= seqlen_q) {
+                            #pragma unroll
+                            for (int ni = 0; ni < size<1>(dS); ++ni) { dS(mi, ni) = 0.0f; }
+                        }
+                    }
                 }
             }
             // The stage's dPsum rows were read above and the dP gemm has retired: raw dO's readers are done.
@@ -902,7 +969,10 @@ struct CollectiveMainloopBwdSm90Fp8R {
             float const fq8_psi = fmaxf(fq8_psi_raw, fq8_g_max * (256.0f * 1e-8f) / fq8_q8sc);
             float const fq8_psi_inv = fq8_tile_zero ? 0.0f : 1.0f / fq8_psi;
             if (thread_idx == 0) {
-                params.ptr_psi[(int64_t(fq8_bh) * params.nbm + m_block) * params.nbn + n_block] = fq8_tile_zero ? 0.0f : fq8_psi;
+                int64_t const fq8_tile_idx = Varlen
+                    ? (fq8_tile_base_seq + int64_t(m_block) * fq8_nbn_seq + n_block)
+                    : ((int64_t(fq8_bh) * params.nbm + m_block) * params.nbn + n_block);
+                params.ptr_psi[fq8_tile_idx] = fq8_tile_zero ? 0.0f : fq8_psi;
             }
             // dS' codes = e4m3(dS / psi) as the RS A operand of dK.
             #pragma unroll

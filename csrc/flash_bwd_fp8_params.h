@@ -3,6 +3,13 @@
 #include "flash.h"
 
 struct Flash_bwd_fp8_params : public Flash_bwd_params {
+    // Route-A sequence-packed metadata. Null pointers retain the dense path.
+    int const* cu_seqlens_padded;
+    int const* seqlens_actual;
+    int64_t const* cu_padded_sq;
+    int64_t total_padded_sq;
+    int num_seqs;
+    bool is_varlen;
     void const* qt_ptr;
     void const* kt_ptr;
     void const* dot_ptr;
@@ -43,6 +50,11 @@ struct Flash_bwd_fp8_params : public Flash_bwd_params {
 
 // ## FQ8: fwd params extension (per-block scales).
 struct Flash_fwd_fp8_params : public Flash_fwd_params {
+    // Route-A sequence-packed metadata. Null pointers retain the dense path.
+    int const* cu_seqlens_padded;
+    int const* seqlens_actual;
+    int num_seqs;
+    bool is_varlen;
     float const* q8s_ptr;
     float const* k8s_ptr;
     float const* v8s_ptr;

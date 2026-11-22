@@ -27,8 +27,11 @@ import torch
 
 # The sm90 entry points and submodules load on first use (PEP 562), so importing a subpackage such as
 # delta_matching.sm100 does not import the sm90 producers (and with them Triton).
-_LAZY = {"dm_attn_func_bhnd": ".attn", "blocks": ".core", "dm_attn_func_plain": ".core"}
-_SUBMODULES = ("attn", "constants", "core", "doq", "producers", "quant", "split", "twins")
+_LAZY = {"dm_attn_func_bhnd": ".attn", "blocks": ".core", "dm_attn_func_plain": ".core",
+         "varlen_align": ".varlen", "make_varlen_metadata": ".varlen", "pack_varlen_sequences": ".varlen",
+         "unpack_varlen_tensor": ".varlen", "quant_qkv_varlen": ".varlen", "doq_varlen": ".varlen",
+         "dm_attn_varlen_func": ".varlen", "dm_attn_varlen_backward": ".varlen"}
+_SUBMODULES = ("attn", "constants", "core", "doq", "producers", "quant", "split", "twins", "varlen")
 
 
 def __getattr__(name):
@@ -46,6 +49,8 @@ KERNEL_NUMERICS = {"128": "Delta-Matching-128 v3", "256": "Delta-Matching-256 v1
 FA_SRC_COMMIT = "0251105a2fb19d2957484b7f023cd8c115286ced"
 CUTLASS_COMMIT = "7127592069c2fe01b041e174ba4345ef9b279671"
 __all__ = ["dm_attn_func", "dm_attn_func_bhnd", "dm_attn_func_plain", "flash_attn_func", "blocks", "kernel_version",
+           "varlen_align", "make_varlen_metadata", "pack_varlen_sequences", "unpack_varlen_tensor",
+           "quant_qkv_varlen", "doq_varlen", "dm_attn_varlen_func", "dm_attn_varlen_backward",
            "__version__", "KERNEL_NUMERICS"]
 
 
