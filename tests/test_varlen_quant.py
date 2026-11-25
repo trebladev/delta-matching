@@ -24,6 +24,11 @@ def _eq8(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
 
+def test_varlen_align_is_128_for_both_head_dims():
+    assert varlen_align(128) == 128
+    assert varlen_align(256) == 128
+
+
 def test_varlen_metadata_uses_int64_squared_offsets():
     actual = torch.tensor([1, 257, 0], dtype=torch.int32)
     cu, got, sq = make_varlen_metadata(actual, 256)
@@ -101,7 +106,7 @@ def test_backward_split_accepts_squared_varlen_workspace(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 @pytest.mark.parametrize("D,lens", [
-    (128, [256, 0, 512, 256]),
+    (128, [128, 256, 0, 128]),
     (256, [128, 384, 0, 256]),
 ])
 @pytest.mark.parametrize("H,Hk", [(4, 4), (8, 2)])

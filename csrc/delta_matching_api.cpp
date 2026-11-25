@@ -178,11 +178,6 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8_core(
                 "delta_matching fwd: k8/v8 heads must divide q8 heads (native GQA)");
     TORCH_CHECK(fp11_hd_supported(head_size), "delta_matching fwd: head_dim must be 256 (or 128 in a Delta-Matching-128 build)");
     TORCH_CHECK(seqlen_q % 128 == 0 && seqlen_k % 128 == 0, "delta_matching fwd: seqlens must be 128-multiples");
-    // The hd128 forward stages a 128-key tile's K / V scales by a 16-byte bulk copy of its 256-key pair's four scales:
-    // aligned, and inside the head's scale row, only when seqlen_k is a 256-multiple.
-    if (head_size == 128) {
-        TORCH_CHECK(seqlen_k % 256 == 0, "delta_matching fwd (Delta-Matching-128): seqlen_k must be a 256-multiple (got ", seqlen_k, ")");
-    }
     for (auto const& t : {q8, k8, v8}) { TORCH_CHECK(t.stride(-1) == 1); }
     for (auto const& t : {q8s, k8s, v8s}) { TORCH_CHECK(t.is_contiguous()); }
     // ## FQ8F: the two scale-granularity contracts the v10 backward reads
@@ -721,7 +716,7 @@ at::Tensor delta_fp8_varlen(
     int const num_seqs = seqlens_actual.size(0);
     TORCH_CHECK(cu_seqlens_padded.size(0) == num_seqs + 1 && cu_padded_sq.size(0) == num_seqs + 1,
                 "delta_matching delta_varlen: metadata length mismatch");
-    int const align = head_size == 128 ? 256 : 128;
+    int const align = 128;
     TORCH_CHECK(total_padded % align == 0, "delta_matching delta_varlen: total_padded must be a multiple of ", align);
     TORCH_CHECK(total_padded_sq >= 0 && total_padded_sq % 32 == 0,
                 "delta_matching delta_varlen: invalid total_padded_sq");
@@ -856,7 +851,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_varlen_core(
     int const num_seqs = seqlens_actual.size(0);
     TORCH_CHECK(cu_seqlens_padded.size(0) == num_seqs + 1 && cu_padded_sq.size(0) == num_seqs + 1,
                 "delta_matching bwd_varlen: metadata length mismatch");
-    int const align = head_size == 128 ? 256 : 128;
+    int const align = 128;
     int const kbn = fp11_bwd_block_n(head_size);
     TORCH_CHECK(total_padded % align == 0, "delta_matching bwd_varlen: total_padded must be a multiple of ", align);
     TORCH_CHECK(total_padded_sq >= 0 && total_padded_sq % (int64_t(64) * kbn) == 0,

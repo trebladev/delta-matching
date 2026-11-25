@@ -3,7 +3,7 @@ and Triton quantizers / K-centering for Hopper SM90.
 
 Data contract:
   - Each sequence b is padded at its tail to a multiple of ALIGN:
-      D == 128 -> ALIGN = 256  (scale blocks: Q/dO = 128, K/V = 64)
+      D == 128 -> ALIGN = 128  (scale blocks: Q/dO = 128, K/V = 64)
       D == 256 -> ALIGN = 128  (scale blocks: Q/dO =  64, K/V = 32)
   - Packed 3-D tensors:
       Q, O, dO: (TotalPaddedTokens, H, D)
@@ -30,7 +30,7 @@ E4M3_MAX = tl.constexpr(448.0)
 def varlen_align(head_dim: int) -> int:
     """Return Route-A sequence tail alignment for a given head dimension."""
     if head_dim == 128:
-        return 256
+        return 128
     if head_dim == 256:
         return 128
     raise ValueError(f"delta_matching: head_dim must be 128 or 256 (got {head_dim})")

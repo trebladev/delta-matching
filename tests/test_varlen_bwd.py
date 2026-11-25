@@ -70,7 +70,7 @@ def _ref_varlen_fwd_bwd(q, k, v, dout, cu, actual, causal):
 
 
 @pytest.mark.parametrize("D,lens", [
-    (128, [256, 0, 512, 256]),
+    (128, [128, 256, 0, 128]),
     (256, [128, 384, 0, 256]),
 ])
 @pytest.mark.parametrize("H,Hk", [(4, 4), (8, 2)])

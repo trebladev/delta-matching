@@ -138,7 +138,7 @@ def test_flash_attn_alias_and_argument_checks():
     with pytest.raises(ValueError, match="mode"):
         dm.dm_attn_func(q, k, v, causal=True, mode="other")
     with pytest.raises(ValueError, match="seqlen"):
-        dm.dm_attn_func(q[:, :1000], k[:, :1000], v[:, :1000], causal=True)   # seqlen % 256 == 0 at head_dim 128
+        dm.dm_attn_func(q[:, :1000], k[:, :1000], v[:, :1000], causal=True)   # seqlen % 128 == 0
     with pytest.raises(TypeError, match="bfloat16"):
         dm.dm_attn_func(q.float(), k.float(), v.float(), causal=True)         # bf16 only
 
@@ -185,10 +185,10 @@ def _worst_row(x, r):
     return float(((xr - rr).norm(dim=-1) / rn.clamp_min(1e-3 * float(rn.square().mean().sqrt()))).max())
 
 
-# N: one 256-row pass-0 CTA, partial last 192-row forward tiles (512, 1280, 1792), exact 192-multiples (768, 2304);
-# MHA, GQA, MQA; batch > 1
-@pytest.mark.parametrize("B,N,H,Hk", [(1, 256, 2, 1), (1, 512, 4, 2), (1, 768, 4, 2), (2, 1280, 4, 4), (1, 1792, 4, 1),
-                                      (1, 2304, 6, 3), (3, 1024, 6, 6), (2, 2048, 8, 2)])
+# N: 128-multiples (ALIGN=128), including 128-row pass-0 fallback (128, 384), one 256-row pass-0 CTA,
+# partial last 192-row forward tiles (512, 1280, 1792), exact 192-multiples (768, 2304); MHA, GQA, MQA; batch > 1
+@pytest.mark.parametrize("B,N,H,Hk", [(1, 128, 2, 1), (1, 256, 2, 1), (1, 384, 4, 2), (1, 512, 4, 2), (1, 768, 4, 2),
+                                      (2, 1280, 4, 4), (1, 1792, 4, 1), (1, 2304, 6, 3), (3, 1024, 6, 6), (2, 2048, 8, 2)])
 def test_hd128_matches_fp64_reference_rowwise(B, N, H, Hk):
     """Head-dim 128 outputs match the fp64 reference both globally and row by row."""
     q, k, v, do = _inputs(B, H, Hk, N, 128, N + 7 * H)

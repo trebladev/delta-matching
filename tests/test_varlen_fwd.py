@@ -36,12 +36,13 @@ def _ref_seq_fp32(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: boo
 
 
 @pytest.mark.parametrize("D,lens", [
-    # D=128 (ALIGN=256, kBlockM=192):
-    # - 1, 17, 191, 192: within first kBlockM=192 tile
-    # - 193, 200, 255: second kBlockM=192 tile CROSSES ALIGN=256 (tests tail boundary safety!)
+    # D=128 (ALIGN=128, kBlockM=192):
+    # - 1, 17, 65, 127: pad to 128; the first kBlockM=192 tile overruns padded_len
+    # - 128, 129: padded_len=128 / 256; 128 is a full-tile overrun into seq+1
+    # - 191, 192, 193, 200, 255: first/second 192-row tile vs ALIGN=128 tails
     # - 256, 384, 400, 512: multi-tile interior TMA + tail mix
     # - 0: leading, middle, trailing empty sequences
-    (128, [0, 1, 17, 191, 192, 193, 200, 255, 0, 256, 384, 400, 512, 0]),
+    (128, [0, 1, 17, 65, 127, 128, 129, 191, 192, 193, 200, 255, 0, 256, 384, 400, 512, 0]),
     # D=256 (ALIGN=128, kBlockM=128):
     # - 1, 31, 65, 127, 128, 129, 255, 300, 512 + zeros
     (256, [0, 1, 31, 65, 127, 128, 129, 0, 255, 300, 512, 0]),
@@ -81,7 +82,7 @@ def test_varlen_fwd_matches_per_sequence_fp32_reference(D, lens, causal, H, Hk):
 
 
 @pytest.mark.parametrize("D,lens", [
-    (128, [256, 512, 0, 256, 768]),
+    (128, [128, 256, 0, 128, 384]),
     (256, [128, 384, 0, 256, 512]),
 ])
 @pytest.mark.parametrize("causal", [True, False])
@@ -113,12 +114,12 @@ def test_varlen_fwd_bitwise_matches_dense_when_aligned(D, lens, causal, H, Hk):
 @pytest.mark.parametrize("D", [128, 256])
 @pytest.mark.parametrize("causal", [True, False])
 def test_varlen_fwd_hd128_tail_never_overwrites_next_sequence(D, causal):
-    """Specifically stress adjacent sequences with lengths > kBlockM (e.g. 200, 200 at D=128)
-    where sequence 0's second kBlockM=192 tile covers [192, 384) crossing ALIGN=256 into seq 1."""
+    """Stress adjacent sequences whose kBlockM=192 (D=128) tiles cross ALIGN=128 into the next
+    sequence: padded_len=128 (first tile [0, 192)) and longer tails (e.g. 200 pads to 256)."""
     dev = "cuda"
     H, Hk = 8, 2
-    # Two adjacent 200-token sequences + a 1-token sequence + a 255-token sequence
-    lens = [200, 200, 1, 255, 193, 193]
+    # padded_len=128 (65, 128, 100, 1) plus longer sequences whose 192-row tiles still tail
+    lens = [65, 128, 100, 1, 200, 200, 255, 193]
     g = torch.Generator(device="cpu").manual_seed(42 + D)
     q_list = [torch.randn(n, H, D, generator=g).to(dev, BF) for n in lens]
     k_list = [torch.randn(n, Hk, D, generator=g).to(dev, BF) for n in lens]

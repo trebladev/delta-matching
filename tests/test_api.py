@@ -124,7 +124,7 @@ def test_input_errors_are_clear_exceptions():
     _raises(TypeError, "bfloat16", lambda: dm_attn_func(q.half(), k.half(), v.half(), causal=True))
     _raises(TypeError, "bfloat16", lambda: dm_attn_func(q.float(), k.float(), v.float(), causal=True))
     _raises(ValueError, "head_dim", lambda: dm_attn_func(q[..., :64], k[..., :64], v[..., :64], causal=True))
-    _raises(ValueError, "256", lambda: dm_attn_func(q[:, :384], k[:, :384], v[:, :384], causal=True))    # hd128: 256-multiple
+    _raises(ValueError, "128", lambda: dm_attn_func(q[:, :192], k[:, :192], v[:, :192], causal=True))    # seqlens must be 128-multiples
     _raises(ValueError, "nheads", lambda: dm_attn_func(q[:, :, :7], k, v, causal=True))
     _raises(ValueError, "seqlen", lambda: dm_attn_func(q[:, :512], k, v, causal=True))
     _raises(ValueError, "CUDA", lambda: dm_attn_func(q.cpu(), k.cpu(), v.cpu(), causal=True))
@@ -138,7 +138,7 @@ def test_input_errors_are_clear_exceptions():
     # the (B, H, N, D) entry points share the contract
     qb, kb, vb = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
     _raises(ValueError, "causal", lambda: dm_attn_func_bhnd(qb, kb, vb, causal=False, delta_mode="matched"))
-    _raises(ValueError, "seqlen", lambda: dm_attn_func_plain(qb[:, :, :384], kb[:, :, :384], vb[:, :, :384], causal=True))
+    _raises(ValueError, "seqlen", lambda: dm_attn_func_plain(qb[:, :, :192], kb[:, :, :192], vb[:, :, :192], causal=True))
     # the default scale passed explicitly is accepted
     dm_attn_func(q, k, v, causal=True, softmax_scale=q.shape[-1] ** -0.5)
 
@@ -146,6 +146,14 @@ def test_input_errors_are_clear_exceptions():
 def test_head_dim_256_accepts_128_multiples():
     from delta_matching import dm_attn_func
     q, k, v = _inputs(B=1, N=384, H=4, Hk=1, D=256, grad=False)
+    assert dm_attn_func(q, k, v, causal=True).shape == q.shape
+
+
+def test_head_dim_128_accepts_128_multiples():
+    from delta_matching import dm_attn_func
+    q, k, v = _inputs(B=1, N=128, H=4, Hk=1, D=128, grad=False)
+    assert dm_attn_func(q, k, v, causal=True).shape == q.shape
+    q, k, v = _inputs(B=1, N=384, H=4, Hk=1, D=128, grad=False)
     assert dm_attn_func(q, k, v, causal=True).shape == q.shape
 
 
@@ -218,14 +226,14 @@ except RuntimeError as ex:
     assert "RUNTIME-ERROR True" in p.stdout, p.stdout + p.stderr[-2000:]
 
 
-def test_hd128_raw_forward_refuses_seqlens_that_are_not_256_multiples(tmp_path):
-    """At head_dim 128, fwd_fp8 raises a RuntimeError when the sequence length is not a multiple of 256."""
+def test_hd128_raw_forward_refuses_seqlens_that_are_not_128_multiples(tmp_path):
+    """At head_dim 128, fwd_fp8 raises a RuntimeError when the sequence length is not a multiple of 128."""
     code = r"""
 import torch
 from delta_matching.core import _ops, blocks
 from delta_matching.producers import quant_qkv_m17
 ops = _ops()
-B, H, N, D = 1, 4, 384, 128
+B, H, N, D = 1, 4, 192, 128
 x = torch.randn(B, H, N, D, device="cuda").to(torch.bfloat16)
 Q8, Q8s, K8, K8s, V8, V8s, _, _ = quant_qkv_m17(x, x, x, want_qt=True, blocks=blocks(D))
 b = lambda t: t.view(B, H, N, D).permute(0, 2, 1, 3)
@@ -234,7 +242,7 @@ try:
     torch.cuda.synchronize()
     print("NO-ERROR")
 except RuntimeError as ex:
-    print("RUNTIME-ERROR", "256-multiple" in str(ex))
+    print("RUNTIME-ERROR", "128-multiple" in str(ex))
 """
     import delta_matching
     env = dict(os.environ)

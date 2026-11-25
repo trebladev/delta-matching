@@ -139,9 +139,8 @@ def _check_inputs(q, k, v, causal, softmax_scale, mode):
         raise ValueError(f"delta_matching: nheads ({H}) must be a positive multiple of nheads_k ({Hk})")
     if D not in (128, 256):
         raise ValueError(f"delta_matching: head_dim must be 128 or 256 (got {D})")
-    mult = 256 if D == 128 else 128
-    if N == 0 or N % mult:
-        raise ValueError(f"delta_matching: seqlen must be a positive multiple of {mult} at head_dim {D} (got {N})")
+    if N == 0 or N % 128:
+        raise ValueError(f"delta_matching: seqlen must be a positive multiple of 128 at head_dim {D} (got {N})")
     if B == 0:
         raise ValueError("delta_matching: empty batch")
     if B * H > 65535:

@@ -4,9 +4,11 @@
  * Retains aligned TMA Store into (TotalPaddedTokens, H, D) for every tile
  * satisfying (m_block + 1) * kBlockM <= padded_len[b]:
  *   - D=256 (kBlockM=128, ALIGN=128): 100% of tiles use aligned TMA Store.
- *   - D=128 (kBlockM=192, ALIGN=256): all interior tiles use aligned TMA Store;
- *     only a tail tile crossing padded_len[b] falls back to predicated
- *     vectorized store so sequence b+1 is never overwritten.
+ *   - D=128 (kBlockM=192, ALIGN=128): interior tiles with
+ *     (m_block + 1) * 192 <= padded_len[b] use aligned TMA Store; a tail tile
+ *     crossing padded_len[b] (including every padded_len=128 sequence, whose
+ *     first 192-row tile overruns by 64) falls back to predicated vectorized
+ *     store so sequence b+1 is never overwritten.
  * Pad rows [seqlens_actual[b], padded_len[b]) are zeroed in registers before
  * storing so O stays strictly 0.0 in every pad slot.
  ******************************************************************************/

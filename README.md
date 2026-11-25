@@ -38,7 +38,7 @@ o = dm_attn_func(q, k, v, causal=True, mode="stale")     # the conventional delt
 | hardware | NVIDIA Hopper (sm90), CUDA 13, PyTorch >= 2.12, Triton (the quantization producers) |
 | head dims | 128 and 256 (one binary serves both) |
 | layout | flash-attention: `(batch, seqlen, nheads, headdim)`, bf16 in, bf16 out; GQA / MQA (`nheads % nheads_k == 0`) |
-| attention | self-attention (q, k, v share `seqlen`); causal (both modes) or full (stale mode only); `seqlen % 256 == 0` at head dim 128, `seqlen % 128 == 0` at head dim 256; `batch * nheads <= 65535`; `softmax_scale` fixed at `headdim ** -0.5`; no dropout, sliding windows, softcap, alibi, variable-length batches or KV cache |
+| attention | self-attention (q, k, v share `seqlen`); causal (both modes) or full (stale mode only); `seqlen % 128 == 0` at head dim 128 and 256; `batch * nheads <= 65535`; `softmax_scale` fixed at `headdim ** -0.5`; no dropout, sliding windows, softcap, alibi, variable-length batches or KV cache |
 | numerics | Q, K, V, dO as e4m3 codes with per-block fp32 scales (K centered by its per-head mean); a faithful per-row, per-32-key P basis in the forward; the backward's five matmuls in fp8; deterministic O, dQ, dK, dV |
 | modes | `"matched"`: delta from the backward's own fp8 P / dP (pass 0 of the kernel), `rowsum(dS) = 0` to fp32 round-off. `"stale"`: delta = `rowsum(dO * O)` |
 

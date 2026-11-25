@@ -10,7 +10,7 @@ API (flash-attention layout, tensors (batch, seqlen, nheads, headdim), bf16, CUD
     from delta_matching import dm_attn_func
     o = dm_attn_func(q, k, v, causal=True, mode="matched")     # GQA: k, v carry nheads_k with nheads % nheads_k == 0
     o = dm_attn_func(q, k, v, causal=True, mode="stale")
-Constraints: self-attention (q, k, v share seqlen); head_dim 128 (seqlen % 256 == 0) or 256 (seqlen % 128 == 0); bf16;
+Constraints: self-attention (q, k, v share seqlen); head_dim 128 or 256 (seqlen % 128 == 0); bf16;
 softmax_scale = head_dim ** -0.5; mode "matched" needs causal=True.  Violations raise ValueError / TypeError /
 NotImplementedError.  `dm_attn_func_bhnd` takes (batch, nheads, seqlen, headdim) and returns (batch, seqlen, nheads,
 headdim) (the kernel's native output layout).  `flash_attn_func` has flash-attention 2's signature for one-line ports; it

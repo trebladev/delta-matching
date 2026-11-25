@@ -678,9 +678,10 @@ void run_flash_delta_v6_fp11_hd128(Flash_bwd_fp8_params &params, cudaStream_t st
     else { run_flash_delta_v6_fp11_hd128_w<Is_causal, 2>(params, stream); }
 }
 
+// Varlen pass 0 uses 128-row CTAs (kNWG=2) so each CTA sits inside one ALIGN=128 sequence.
 template <bool Is_causal>
 void run_flash_delta_v6_fp11_varlen_hd128(Flash_bwd_fp8_params &params, cudaStream_t stream) {
-    using Kernel = flash::DeltaV6<Is_causal, 4, true>;
+    using Kernel = flash::DeltaV6<Is_causal, 2, true>;
     using Element = typename Kernel::Element;
     using namespace cute;
     int const total_padded = params.seqlen_q;

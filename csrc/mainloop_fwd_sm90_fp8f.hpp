@@ -403,9 +403,11 @@ struct CollectiveMainloopFwdSm90Fp8F {
 
     // Set the bytes transferred in this TMA transaction (may involve multiple issues)
     static constexpr uint32_t TmaTransactionBytesQ = static_cast<uint32_t>(size(SmemLayoutQ{}) * cutlass::sizeof_bits_v<Element> / 8);
-    // At hd128 the tile's k- and v-scales ride the K stage: the producer bulk-copies the 16-byte aligned windows
-    // k8s / v8s[4 (n / 2) .. +4) (4 n for 256-key tiles) on the K barrier, and the consumers read them from smem.
-    static constexpr bool kSmemSc = kHeadDim < 256 && (kGroups == 2 || kGroups == 4) && FA3FP11_HD128_PVFIRST;
+    // At hd128, 256-key tiles (kGroups==4) bulk-copy a 16-byte window of four K/V scales on the K
+    // barrier. 128-key tiles (kGroups==2) cannot: Hopper bulk-copy is 16B-min and 16B-aligned, so a
+    // 256-key pair copy would force ALIGN=256. Those tiles load the current tile's two K/V scales
+    // from gmem after the K wait (float2, 8B-aligned).
+    static constexpr bool kSmemSc = kHeadDim < 256 && kGroups == 4 && FA3FP11_HD128_PVFIRST;
     static constexpr uint32_t TmaTransactionBytesK = static_cast<uint32_t>(size(take<0, 2>(SmemLayoutK{})) * cutlass::sizeof_bits_v<Element> / 8) + (kSmemSc ? 32u : 0u);
     static constexpr uint32_t TmaTransactionBytesV = static_cast<uint32_t>(size(take<0, 2>(SmemLayoutVt{})) * cutlass::sizeof_bits_v<Element> / 8);
     static constexpr uint32_t TmaTransactionBytesQv = static_cast<uint32_t>(size(SmemLayoutQv{}) * cutlass::sizeof_bits_v<Element> / 8);
@@ -944,7 +946,7 @@ struct CollectiveMainloopFwdSm90Fp8F {
                 if constexpr (kSmemSc) {
                     int const sc_off = ((!is_varlen_k ? bidb : 0) * get<2>(params.shape_K) + bidh_kv) * params.nblk_k
                         + (is_varlen_k ? seqlen_info.offset_k / kQuantKeys : 0)
-                        + (kGroups == 4 ? 4 * n_block : 4 * (n_block >> 1));
+                        + 4 * n_block;
                     float* sc_dst = shared_storage.tensors.mainloop.smem_kvsc.data() + 8 * smem_pipe_write.index();
                     cute::SM90_BULK_COPY_G2S::copy(params.ptr_k8s + sc_off, pipeline_k.producer_get_barrier(smem_pipe_write), sc_dst, 16);
                     cute::SM90_BULK_COPY_G2S::copy(params.ptr_v8s + sc_off, pipeline_k.producer_get_barrier(smem_pipe_write), sc_dst + 4, 16);
@@ -1374,14 +1376,14 @@ struct CollectiveMainloopFwdSm90Fp8F {
         float fq8_ksc[4] = {1.f, 1.f, 1.f, 1.f}, fq8_vsc[4] = {1.f, 1.f, 1.f, 1.f};   // from smem after the K wait
         auto fq8_read_sc = [&](int stage, int n_blk) {
             if constexpr (kSmemSc) {
-                if constexpr (kGroups == 4) {
-                    float const* sc = shared_storage.tensors.mainloop.smem_kvsc.data() + 8 * stage;
-                    #pragma unroll
-                    for (int g = 0; g < 4; ++g) { fq8_ksc[g] = sc[g]; fq8_vsc[g] = sc[4 + g]; }
-                } else {
-                float const* sc = shared_storage.tensors.mainloop.smem_kvsc.data() + 8 * stage + 2 * (n_blk & 1);
-                fq8_ksc[0] = sc[0]; fq8_ksc[1] = sc[1]; fq8_vsc[0] = sc[4]; fq8_vsc[1] = sc[5];
-                }
+                float const* sc = shared_storage.tensors.mainloop.smem_kvsc.data() + 8 * stage;
+                #pragma unroll
+                for (int g = 0; g < 4; ++g) { fq8_ksc[g] = sc[g]; fq8_vsc[g] = sc[4 + g]; }
+            } else if constexpr (kGroups == 2) {
+                float2 const ksc = *reinterpret_cast<float2 const*>(params.ptr_k8s + fq8_bh_k + 2 * n_blk);
+                float2 const vsc = *reinterpret_cast<float2 const*>(params.ptr_v8s + fq8_bh_k + 2 * n_blk);
+                fq8_ksc[0] = ksc.x; fq8_ksc[1] = ksc.y;
+                fq8_vsc[0] = vsc.x; fq8_vsc[1] = vsc.y;
             }
         };
         // Descales S; may_mask_c marks a tile that may hold masked scores.
@@ -1416,8 +1418,8 @@ struct CollectiveMainloopFwdSm90Fp8F {
             } else {
             // ## Delta-Matching-128: two 64-key groups (16 rowcol columns each).
             float const g_[2] = {   // floored at FLT_MIN (see the F3 branch)
-                fmaxf(fq8_q8sc * (kSmemSc ? fq8_ksc[0] : params.ptr_k8s[fq8_bh_k + 2 * n_blk + 0]), 1.17549435e-38f),
-                fmaxf(fq8_q8sc * (kSmemSc ? fq8_ksc[1] : params.ptr_k8s[fq8_bh_k + 2 * n_blk + 1]), 1.17549435e-38f)};
+                fmaxf(fq8_q8sc * fq8_ksc[0], 1.17549435e-38f),
+                fmaxf(fq8_q8sc * fq8_ksc[1], 1.17549435e-38f)};
             #pragma unroll
             for (int mi = 0; mi < size<0>(sc_); ++mi) {
                 #pragma unroll
@@ -1438,11 +1440,8 @@ struct CollectiveMainloopFwdSm90Fp8F {
             fq8_v[1] = params.ptr_v8s[fq8_bh_k + 4 * n_blk + 1];
             fq8_v[2] = params.ptr_v8s[fq8_bh_k + 4 * n_blk + 2];
             fq8_v[3] = params.ptr_v8s[fq8_bh_k + 4 * n_blk + 3];
-            } else if constexpr (kSmemSc) {
-            fq8_v[0] = fq8_vsc[0]; fq8_v[1] = fq8_vsc[1];
             } else {
-            fq8_v[0] = params.ptr_v8s[fq8_bh_k + 2 * n_blk + 0];
-            fq8_v[1] = params.ptr_v8s[fq8_bh_k + 2 * n_blk + 1];
+            fq8_v[0] = fq8_vsc[0]; fq8_v[1] = fq8_vsc[1];
             }
             if constexpr (Varlen) {
                 // Completely padded tail groups (all keys >= seqlen_k) have V=0, P=0 and
@@ -1884,6 +1883,7 @@ struct CollectiveMainloopFwdSm90Fp8F {
                     }
                     scoremod_premask_fn(tSrS);
                     mask_fn(tSrS, n_block);
+                    fq8_read_sc(smem_pipe_read.index(), n_block);
                     fq8_descale(tSrS, n_block, cute::bool_constant<Check_inf>{});   // ## FQ8
                     warpgroup_wait<0>();
                     fq8_promote_last(tOrD);
