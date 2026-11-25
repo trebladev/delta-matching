@@ -393,6 +393,7 @@ struct P2VarlenParams {
     int const* seqlens_actual;
     int64_t const* cu_padded_sq;
     int64_t total_tiles_per_head;
+    int nbm;
 };
 
 template <bool Is_causal>
@@ -400,7 +401,7 @@ __global__ void __launch_bounds__(128, 1)
 fq8_dq_pass2_varlen_kernel(CUTE_GRID_CONSTANT P2VarlenParams const params) {
     extern __shared__ char smem_raw[];
     auto& shared = *reinterpret_cast<SharedStorage*>(smem_raw);
-    int const global_mb = blockIdx.x;
+    int const global_mb = params.nbm - 1 - int(blockIdx.x);   // longest-first (causal tail tiles first)
     int const h_idx = blockIdx.y;
     int const tid = threadIdx.x;
 
@@ -608,7 +609,7 @@ void run_fq8_dq_pass2_fp11_varlen(Flash_bwd_fp8_params &params, cudaStream_t str
                       params.dq_ptr, params.dq_row_stride, params.dq_head_stride,
                       params.scale_softmax / 256.0f, params.h, params.h_k, params.b,
                       params.cu_seqlens_q, params.seqused_q, params.cu_padded_sq,
-                      total_tiles_per_head};
+                      total_tiles_per_head, total_mb};
     auto* kernel = &fq8p2::fq8_dq_pass2_varlen_kernel<Is_causal>;
     constexpr int kSmem = int(sizeof(SharedStorage));
     if (kSmem >= 48 * 1024) {

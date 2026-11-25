@@ -217,7 +217,9 @@ int dm_varlen_locate_seq(int const* __restrict__ cu_seqlens_padded, int num_seqs
 // Single-tile (non-persistent) varlen backward scheduler.
 // Eliminates persistent smem_k/v vs epilogue smem_dk/dv union races and needs no
 // tile_count_semaphore memset or host sync (100% CUDA-Graph compatible).
-// Grid: (total_padded / kBlockN, num_head, 1).
+// 1-D grid (n_block * num_head) with head fastest so all heads of the same
+// n-block run together (L2 reuse of K/V). Causal: smaller n_block has more Q
+// work, so n_block increases with blockIdx.x (same LPT as dense Pass 1).
 template <int kBlockN, bool Is_causal>
 class DMVarlenSingleTileBwdScheduler {
 public:
@@ -246,7 +248,8 @@ public:
 
     static dim3
     get_grid_shape(Params const& params, int /*num_sm*/) {
-        return {uint32_t(params.num_block), uint32_t(params.num_head), 1u};
+        int64_t const grid_x = int64_t(params.num_block) * params.num_head;
+        return {uint32_t(grid_x), 1u, 1u};
     }
 
     struct WorkTileInfo {
@@ -273,8 +276,9 @@ public:
     CUTLASS_DEVICE
     WorkTileInfo
     get_initial_work(Params const& params) const {
-        int const global_nb = int(blockIdx.x);
-        int const bidh = int(blockIdx.y);
+        int const n_head = params.num_head;
+        int const global_nb = int(blockIdx.x) / n_head;
+        int const bidh = int(blockIdx.x) - global_nb * n_head;
         int const pos = global_nb * kBlockN;
         int const bidb = dm_varlen_locate_seq(params.cu_seqlens, params.num_batch, pos);
         int const local_nb = (pos - params.cu_seqlens[bidb]) / kBlockN;

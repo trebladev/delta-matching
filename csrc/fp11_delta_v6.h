@@ -539,7 +539,7 @@ struct DeltaV6 {
                 warpgroup_fence_operand(tdPrdP0);
             }
             // The v4b unit body on one stage (two n-blocks), HasNext compile-time so every wait count is straight-line.
-            auto step = [&](int s, auto has_next_c, auto stage_c) {
+            auto step = [&](int s, auto has_next_c, auto stage_c, auto may_mask_c) {
                 constexpr bool HasNext = decltype(has_next_c)::value;
                 constexpr int kSt = decltype(stage_c)::value;   // compile-time ring stage under UNROLL3 (-1 = runtime)
                 int const slot0 = kSt >= 0 ? kNbPerStage * kSt : kNbPerStage * smem_pipe_read.index();
@@ -559,7 +559,7 @@ struct DeltaV6 {
                 sched_arrive();
                 warpgroup_wait<2>();   // no-op guard: S0 already retired
                 warpgroup_fence_operand(tSrS0);
-                exp_step(tSrS0, nb0, dsc0, dsc0);
+                exp_step_t(may_mask_c, tSrS0, nb0, dsc0, dsc0);
                 warpgroup_fence_operand(tdPrdP0);
                 rowsum_step(tSrS0, tdPrdP0, dp0, dp0);
                 PipelineState smem_pipe_read_next = smem_pipe_read;
@@ -577,7 +577,7 @@ struct DeltaV6 {
                     warpgroup_wait<1>();
                 }
                 warpgroup_fence_operand(tSrS1);
-                exp_step(tSrS1, nb1, dsc1, dsc1);
+                exp_step_t(may_mask_c, tSrS1, nb1, dsc1, dsc1);
                 if constexpr (HasNext) { warpgroup_wait<2>(); } else { warpgroup_wait<0>(); }   // dP1 retired: every read of this stage is done
                 warpgroup_fence_operand(tdPrdP1);
                 pipeline_kv.consumer_release(smem_pipe_read);
@@ -587,9 +587,28 @@ struct DeltaV6 {
                 warpgroup_fence_operand(tSrS0);
                 warpgroup_fence_operand(tdPrdP0);
             };
+            int s0_tail = 0;
+            // Leading stages that need no mask (need_mask is monotone in the n-block) run without the mask test.
+            {
+                int const xdiag = m_block * kBlockM + fq8_diag_off;
+                int const nbm0c = Is_causal ? (xdiag <= 0 ? 0 : xdiag / kBlockN) : (1 << 30);
+                int const nbm0_len = Varlen ? (seqlen_k / kBlockN) : params.nbn;
+                int const nbm0 = min(nbm0c, nbm0_len);
+                s0_tail = min(max(nbm0 / kNbPerStage, 0), nstages);
+            }
             CUTLASS_PRAGMA_NO_UNROLL
-            for (int s = 0; s < nstages - 1; ++s) { step(s, cute::true_type{}, cute::Int<-1>{}); }
-            step(nstages - 1, cute::false_type{}, cute::Int<-1>{});
+            for (int s = 0; s < s0_tail && s < nstages - 1; ++s) {
+                step(s, cute::true_type{}, cute::Int<-1>{}, cute::false_type{});
+            }
+            if (s0_tail == nstages) {
+                step(nstages - 1, cute::false_type{}, cute::Int<-1>{}, cute::false_type{});
+            } else {
+                CUTLASS_PRAGMA_NO_UNROLL
+                for (int s = s0_tail; s < nstages - 1; ++s) {
+                    step(s, cute::true_type{}, cute::Int<-1>{}, cute::true_type{});
+                }
+                step(nstages - 1, cute::false_type{}, cute::Int<-1>{}, cute::true_type{});
+            }
             }
             {
                 double r0 = acc_q0 + __shfl_xor_sync(uint32_t(-1), acc_q0, 1);

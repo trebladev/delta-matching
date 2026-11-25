@@ -161,63 +161,94 @@ def unpack_varlen_tensor(
 
 # ----------------------------------------------------------------------------- Triton K-Centering (Varlen)
 @triton.jit
-def _kmean_varlen_kernel(
+def _kmean_varlen_partial_kernel(
     K,        # (TotalPaddedTokens, Hk, D) bf16 with strides (skn, skh, skd)
     CU,       # int32 [B + 1]
     ACTUAL,   # int32 [B]
-    KM,       # fp32 [B, Hk, D] contiguous
-    Hk,
+    KP,       # fp32 [B * Hk, max_chunks, D] contiguous
+    Hk, max_chunks,
     skn, skh, skd,
     D: tl.constexpr,
     BD: tl.constexpr,
 ):
-    """Per-(seq, head) FP32 mean of K over ONLY valid tokens [cu[b], cu[b] + actual[b]).
-    Accumulates in 64-row chunks in ascending order (bitwise identical to quant._kmean_kernel
-    on isolated sequences); stores 0.0 when actual[b] == 0 (no div-by-zero)."""
+    """KP[bh, j, d] = sum of K[seq, 64j:64j+64, d] over valid tokens (masked last chunk).
+    One program per (seq*head, 64-row chunk, D-chunk); bitwise the serial 64-row term."""
     pid_bh = tl.program_id(0)
-    pid_d = tl.program_id(1)
+    pid_j = tl.program_id(1)
+    pid_d = tl.program_id(2)
     b = pid_bh // Hk
     h = pid_bh % Hk
     start = tl.load(CU + b)
     actual = tl.load(ACTUAL + b)
     rd = pid_d * BD + tl.arange(0, BD)
+    n = pid_j * 64
+    if n >= actual:
+        return
+    rn = n + tl.arange(0, 64)
+    mask_n = rn < actual
+    off = (
+        (start.to(tl.int64) + rn.to(tl.int64))[:, None] * skn
+        + h.to(tl.int64) * skh
+        + rd.to(tl.int64)[None, :] * skd
+    )
+    x = tl.load(K + off, mask=mask_n[:, None], other=0.0).to(tl.float32)
+    s = tl.sum(x, axis=0)
+    tl.store(KP + (pid_bh.to(tl.int64) * max_chunks + pid_j) * D + rd, s)
+
+
+@triton.jit
+def _kmean_varlen_fold_kernel(
+    KP,       # fp32 [B * Hk, max_chunks, D] contiguous
+    ACTUAL,   # int32 [B]
+    KM,       # fp32 [B, Hk, D] contiguous
+    Hk, max_chunks,
+    D: tl.constexpr,
+    BD: tl.constexpr,
+):
+    """KM[bh, d] = (((0 + s_0) + s_1) + ...) / actual, same chunk order as the serial kernel."""
+    pid_bh = tl.program_id(0)
+    pid_d = tl.program_id(1)
+    b = pid_bh // Hk
+    actual = tl.load(ACTUAL + b)
+    rd = pid_d * BD + tl.arange(0, BD)
     acc = tl.zeros([BD], dtype=tl.float32)
     if actual > 0:
         n = 0
+        j = 0
         while n < actual:
-            rn = n + tl.arange(0, 64)
-            mask_n = rn < actual
-            off = (
-                (start.to(tl.int64) + rn.to(tl.int64))[:, None] * skn
-                + h.to(tl.int64) * skh
-                + rd.to(tl.int64)[None, :] * skd
-            )
-            x = tl.load(K + off, mask=mask_n[:, None], other=0.0).to(tl.float32)
-            acc += tl.sum(x, axis=0)
+            acc += tl.load(KP + (pid_bh.to(tl.int64) * max_chunks + j) * D + rd)
+            j += 1
             n += 64
-        mean = acc / actual.to(tl.float32)
-    else:
-        mean = acc
-    tl.store(KM + pid_bh.to(tl.int64) * D + rd, mean)
+        acc = acc / actual.to(tl.float32)
+    tl.store(KM + pid_bh.to(tl.int64) * D + rd, acc)
 
 
 def kmean_varlen(
     k: torch.Tensor, cu_seqlens_padded: torch.Tensor, seqlens_actual: torch.Tensor
 ) -> torch.Tensor:
     """Compute per-sequence, per-head FP32 mean of K over valid tokens only.
-    k: (TotalPaddedTokens, Hk, D) bf16 CUDA -> KM: (B, Hk, D) fp32 contiguous."""
+    k: (TotalPaddedTokens, Hk, D) bf16 CUDA -> KM: (B, Hk, D) fp32 contiguous.
+    Parallel per-64-row partials plus a serial fold in the original chunk order
+    (bitwise the previous per-(seq, head) serial loop)."""
     if k.dim() != 3:
         raise ValueError(f"delta_matching: packed K must be 3-D (T, Hk, D), got {k.dim()}-D")
-    _, Hk, D = k.shape
+    T, Hk, D = k.shape
     B = seqlens_actual.shape[0]
     km = torch.zeros((B, Hk, D), device=k.device, dtype=torch.float32)
-    if B == 0 or Hk == 0:
+    if B == 0 or Hk == 0 or T == 0:
         return km
     BD = 64 if D % 64 == 0 else D
-    _kmean_varlen_kernel[(B * Hk, D // BD)](
-        k, cu_seqlens_padded, seqlens_actual, km,
-        Hk, k.stride(0), k.stride(1), k.stride(2),
+    max_chunks = (T + 63) // 64
+    kp = torch.empty((B * Hk, max_chunks, D), device=k.device, dtype=torch.float32)
+    _kmean_varlen_partial_kernel[(B * Hk, max_chunks, D // BD)](
+        k, cu_seqlens_padded, seqlens_actual, kp,
+        Hk, max_chunks, k.stride(0), k.stride(1), k.stride(2),
         D=D, BD=BD,
+    )
+    _kmean_varlen_fold_kernel[(B * Hk, D // BD)](
+        kp, seqlens_actual, km,
+        Hk, max_chunks,
+        D=D, BD=BD, num_warps=1,
     )
     return km
 

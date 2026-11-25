@@ -423,6 +423,12 @@ void run_flash_bwd_fp11_varlen_d128(Flash_bwd_fp8_params &params, cudaStream_t s
     cudaGetDevice(&device);
     typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments(
         {mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args});
+    int64_t const grid_x = int64_t(num_blocks_n) * params.h;
+    if (grid_x <= 0 || grid_x > 0x7fffffff) {
+        fprintf(stderr, "[delta_matching pass 1 varlen hd128] grid too large: nbn=%d h=%d\n",
+                num_blocks_n, params.h);
+        exit(1);
+    }
     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
     dim3 block_dims = AttnKernel::get_block_shape();
     int smem_size = AttnKernel::SharedStorageSize;
@@ -527,6 +533,12 @@ void run_flash_bwd_fp11_varlen_d256(Flash_bwd_fp8_params &params, cudaStream_t s
     cudaGetDevice(&device);
     typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments(
         {mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args});
+    int64_t const grid_x = int64_t(num_blocks_n) * params.h;
+    if (grid_x <= 0 || grid_x > 0x7fffffff) {
+        fprintf(stderr, "[delta_matching pass 1 varlen d256] grid too large: nbn=%d h=%d\n",
+                num_blocks_n, params.h);
+        exit(1);
+    }
     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
     dim3 block_dims = AttnKernel::get_block_shape();
     int smem_size = AttnKernel::SharedStorageSize;
