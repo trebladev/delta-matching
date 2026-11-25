@@ -212,9 +212,12 @@ struct DeltaV6 {
         MainloopPipeline pipeline_kv(shared_storage.pipelines.pipeline_kv, pipeline_params, ClusterShape{});
         __syncthreads();
 
-        // CTA = (m-pair p, bh); grid (bh, p) with x fastest, so the longest row blocks of all heads go first.
-        int const p_global = params.npairs - 1 - int(blockIdx.y);
-        int const bh = int(blockIdx.x);
+        // CTA = (m-pair p, bh). 1-D grid (p_idx * n_bh + bh) so npairs is not bound by
+        // gridDim.y (65535); x-fastest order still sends the longest row blocks of all heads first.
+        int const n_bh = Varlen ? params.num_heads : (params.num_batch * params.num_heads);
+        int const p_idx = int(blockIdx.x) / n_bh;
+        int const bh = int(blockIdx.x) - p_idx * n_bh;
+        int const p_global = params.npairs - 1 - p_idx;
         int const bidb = Varlen ? 0 : (bh / params.num_heads);
         int const bidh = Varlen ? bh : (bh - bidb * params.num_heads);
         int const bidh_kv = params.qhead_per_khead_divmod.divide(bidh);
@@ -654,7 +657,13 @@ void run_flash_delta_v6_fp11_hd128_w(Flash_bwd_fp8_params &params, cudaStream_t 
         nbm, nbn, npairs, params.b, params.h,
         nullptr, nullptr, params.b, seqlen_q
     };
-    dim3 grid_dims(params.b * params.h, npairs, 1);
+    int64_t const grid_x = int64_t(npairs) * params.b * params.h;
+    if (grid_x <= 0 || grid_x > 0x7fffffff) {
+        fprintf(stderr, "[delta_matching pass 0] grid too large: npairs=%d b=%d h=%d\n",
+                npairs, params.b, params.h);
+        exit(1);
+    }
+    dim3 grid_dims(static_cast<unsigned>(grid_x), 1, 1);
     dim3 block_dims(Kernel::MaxThreadsPerBlock, 1, 1);
     int smem_size = Kernel::SharedStorageSize;
     auto kernel = cutlass::device_kernel<Kernel>;
@@ -725,7 +734,13 @@ void run_flash_delta_v6_fp11_varlen_hd128(Flash_bwd_fp8_params &params, cudaStre
         nbm, nbn, npairs, 1, params.h,
         params.cu_seqlens_padded, params.seqlens_actual, params.num_seqs, total_padded
     };
-    dim3 grid_dims(params.h, npairs, 1);
+    int64_t const grid_x = int64_t(npairs) * params.h;
+    if (grid_x <= 0 || grid_x > 0x7fffffff) {
+        fprintf(stderr, "[delta_matching pass 0 varlen] grid too large: npairs=%d h=%d\n",
+                npairs, params.h);
+        exit(1);
+    }
+    dim3 grid_dims(static_cast<unsigned>(grid_x), 1, 1);
     dim3 block_dims(Kernel::MaxThreadsPerBlock, 1, 1);
     int smem_size = Kernel::SharedStorageSize;
     auto kernel = cutlass::device_kernel<Kernel>;
