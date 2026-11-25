@@ -227,11 +227,22 @@ struct DeltaV6 {
         int seqlen_k = get<0>(params.shape_K);
         int nbn_seq = params.nbn;
         if constexpr (Varlen) {
-            int const pos = p_global * kRowsCTA;
+            // Grid is always 128-row (ALIGN) so packed sequences that start at 128
+            // still get a CTA. kNWG=4 claims sequence-local 256-row windows;
+            // kNWG=2 covers leftovers. Complementary skip: each padded row is owned
+            // by exactly one of the two launches.
+            int const pos = p_global * 128;
             int const seq_idx = dm_varlen_locate_seq(params.cu_seqlens_padded, params.num_seqs, pos);
             offset_seq = params.cu_seqlens_padded[seq_idx];
+            int const padded_len = params.cu_seqlens_padded[seq_idx + 1] - offset_seq;
             int const actual_len = params.seqlens_actual[seq_idx];
-            p = (pos - offset_seq) / kRowsCTA;
+            int const local = pos - offset_seq;
+            if constexpr (kNWG == 4) {
+                if ((local & 255) != 0 || local + 256 > padded_len) { return; }
+            } else {
+                if ((local & ~255) + 256 <= padded_len) { return; }
+            }
+            p = local / kRowsCTA;
             seqlen_q = actual_len;
             seqlen_k = actual_len;
             nbn_seq = (actual_len + kBlockN - 1) / kBlockN;
@@ -706,22 +717,24 @@ void run_flash_delta_v6_fp11_hd128(Flash_bwd_fp8_params &params, cudaStream_t st
     else { run_flash_delta_v6_fp11_hd128_w<Is_causal, 2>(params, stream); }
 }
 
-// Varlen pass 0 uses 128-row CTAs (kNWG=2) so each CTA sits inside one ALIGN=128 sequence.
-template <bool Is_causal>
-void run_flash_delta_v6_fp11_varlen_hd128(Flash_bwd_fp8_params &params, cudaStream_t stream) {
-    using Kernel = flash::DeltaV6<Is_causal, 2, true>;
+// Varlen pass 0: 128-row grid (ALIGN). kNWG=4 CTAs take sequence-local 256-row
+// windows; kNWG=2 covers leftovers. Dual launch, complementary skip in-kernel.
+template <bool Is_causal, int kNWG>
+void run_flash_delta_v6_fp11_varlen_hd128_w(Flash_bwd_fp8_params &params, cudaStream_t stream) {
+    using Kernel = flash::DeltaV6<Is_causal, kNWG, true>;
     using Element = typename Kernel::Element;
     using namespace cute;
+    constexpr int kGridStride = 128;
     int const total_padded = params.seqlen_q;
     if (total_padded == 0 || params.num_seqs == 0) { return; }
-    if (total_padded % Kernel::kRowsCTA != 0 || params.seqlen_k != total_padded) {
+    if (total_padded % kGridStride != 0 || params.seqlen_k != total_padded) {
         fprintf(stderr, "[delta_matching pass 0 varlen] total_padded must be a %d-multiple (got %d, %d)\n",
-                Kernel::kRowsCTA, total_padded, params.seqlen_k);
+                kGridStride, total_padded, params.seqlen_k);
         exit(1);
     }
     int const nbm = total_padded / Kernel::kBlockM;
     int const nbn = total_padded / Kernel::kBlockN;
-    int const npairs = total_padded / Kernel::kRowsCTA;
+    int const npairs = total_padded / kGridStride;
     typename Kernel::ShapeQKV shape_Q = make_shape(total_padded, params.d, params.h, 1);
     typename Kernel::StrideQKV stride_Q = make_stride(params.q_row_stride, _1{}, params.q_head_stride, params.q_batch_stride);
     typename Kernel::StrideQKV stride_dO = make_stride(params.do_row_stride, _1{}, params.do_head_stride, params.do_batch_stride);
@@ -768,4 +781,10 @@ void run_flash_delta_v6_fp11_varlen_hd128(Flash_bwd_fp8_params &params, cudaStre
     }
     kernel<<<grid_dims, block_dims, smem_size, stream>>>(kp);
     { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess) { fprintf(stderr, "[delta_matching pass 0 varlen] launch: %s\n", cudaGetErrorString(e_)); exit(1); } }
+}
+
+template <bool Is_causal>
+void run_flash_delta_v6_fp11_varlen_hd128(Flash_bwd_fp8_params &params, cudaStream_t stream) {
+    run_flash_delta_v6_fp11_varlen_hd128_w<Is_causal, 4>(params, stream);
+    run_flash_delta_v6_fp11_varlen_hd128_w<Is_causal, 2>(params, stream);
 }

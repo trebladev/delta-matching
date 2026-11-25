@@ -156,6 +156,18 @@ void run_flash_fwd_fp8f_impl(Flash_fwd_fp8_params &params, cudaStream_t stream) 
     if (smem_size >= 48 * 1024) {
         CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     }
+    if constexpr (Varlen) {
+        // Pad slots the 192-row (D=128) tiles never own, and actual=0 padded windows.
+        if (params.num_seqs > 0 && seqlen_q > 0) {
+            flash::dm_zero_varlen_pad_olse_kernel<<<params.num_seqs, 256, 0, stream>>>(
+                static_cast<cutlass::bfloat16_t*>(params.o_ptr),
+                static_cast<float*>(params.softmax_lse_ptr),
+                params.cu_seqlens_padded, params.seqlens_actual,
+                params.h, params.dv, seqlen_q,
+                params.o_row_stride, params.o_head_stride);
+            { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess) { fprintf(stderr, "[delta_matching fwd varlen] pad-zero: %s\n", cudaGetErrorString(e_)); exit(1); } }
+        }
+    }
     CHECK_CUTLASS(cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params, false /*launch_with_pdl*/));
 }
 

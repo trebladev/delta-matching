@@ -188,14 +188,10 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8_core(
     TORCH_CHECK(k8s.size(0) == batch_size && k8s.size(1) == num_heads_k && k8s.size(2) == seqlen_k / rk, "delta_matching: k8s must be (b, h_k, s_k/", rk, ")");
     TORCH_CHECK(v8s.size(0) == batch_size && v8s.size(1) == num_heads_k && v8s.size(2) == seqlen_k / rk, "delta_matching: v8s must be (b, h_k, s_k/", rk, ")");
     auto opts = q8.options();
-    at::Tensor o = is_varlen
-        ? torch::zeros({batch_size, seqlen_q, num_heads, head_size}, opts.dtype(at::kBFloat16))
-        : torch::empty({batch_size, seqlen_q, num_heads, head_size}, opts.dtype(at::kBFloat16));
-    at::Tensor lse = is_varlen
-        ? torch::zeros({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat))
-        : torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+    at::Tensor o = torch::empty({batch_size, seqlen_q, num_heads, head_size}, opts.dtype(at::kBFloat16));
+    at::Tensor lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
     if (is_varlen && (seqlen_q == 0 || seqlens_actual.numel() == 0)) {
-        return {o, lse};
+        return {o.zero_(), lse.zero_()};
     }
     at::Tensor tile_count_sem = torch::zeros({1}, opts.dtype(at::kInt));
 
@@ -737,9 +733,9 @@ at::Tensor delta_fp8_varlen(
     }
 
     auto opts = q8.options();
-    at::Tensor dlt = torch::zeros({num_heads, total_padded}, opts.dtype(at::kFloat));
+    at::Tensor dlt = torch::empty({num_heads, total_padded}, opts.dtype(at::kFloat));
     if (total_padded == 0 || num_seqs == 0 || total_padded_sq == 0) {
-        return dlt;
+        return dlt.zero_();
     }
     at::Tensor part = head_size == 256
         ? torch::empty({int64_t(num_heads) * (total_padded_sq / 32)}, opts.dtype(at::kFloat))
@@ -882,11 +878,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_varlen_core(
 
     auto opts = q8.options();
     auto out_opts = opts.dtype(at::kBFloat16);
-    at::Tensor dq = torch::zeros({total_padded, num_heads, head_size}, out_opts);
+    at::Tensor dq = torch::empty({total_padded, num_heads, head_size}, out_opts);
+    // Pad n-blocks are not launched; skip tiles write valid keys only. Keep host-zero dk/dv.
     at::Tensor dk = torch::zeros({total_padded, num_heads, head_size}, out_opts);
     at::Tensor dv = torch::zeros({total_padded, num_heads, head_size}, out_opts);
     if (total_padded == 0 || num_seqs == 0 || total_padded_sq == 0) {
-        return {dq, dk, dv};
+        return {dq.zero_(), dk, dv};
     }
 
     int64_t const total_tiles_per_head = total_padded_sq / (int64_t(64) * kbn);

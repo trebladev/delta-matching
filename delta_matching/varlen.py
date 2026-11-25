@@ -223,13 +223,51 @@ def _kmean_varlen_fold_kernel(
     tl.store(KM + pid_bh.to(tl.int64) * D + rd, acc)
 
 
+@triton.jit
+def _kmean_varlen_serial_kernel(
+    K,        # (TotalPaddedTokens, Hk, D) bf16 with strides (skn, skh, skd)
+    CU,       # int32 [B + 1]
+    ACTUAL,   # int32 [B]
+    KM,       # fp32 [B, Hk, D] contiguous
+    Hk,
+    skn, skh, skd,
+    D: tl.constexpr,
+    BD: tl.constexpr,
+):
+    """One program per (seq*head, D-chunk): serial 64-row walk, bitwise the split path."""
+    pid_bh = tl.program_id(0)
+    pid_d = tl.program_id(1)
+    b = pid_bh // Hk
+    h = pid_bh % Hk
+    start = tl.load(CU + b)
+    actual = tl.load(ACTUAL + b)
+    rd = pid_d * BD + tl.arange(0, BD)
+    acc = tl.zeros([BD], dtype=tl.float32)
+    if actual > 0:
+        n = 0
+        while n < actual:
+            rn = n + tl.arange(0, 64)
+            mask_n = rn < actual
+            off = (
+                (start.to(tl.int64) + rn.to(tl.int64))[:, None] * skn
+                + h.to(tl.int64) * skh
+                + rd.to(tl.int64)[None, :] * skd
+            )
+            x = tl.load(K + off, mask=mask_n[:, None], other=0.0).to(tl.float32)
+            acc += tl.sum(x, axis=0)
+            n += 64
+        acc = acc / actual.to(tl.float32)
+    tl.store(KM + pid_bh.to(tl.int64) * D + rd, acc)
+
+
 def kmean_varlen(
     k: torch.Tensor, cu_seqlens_padded: torch.Tensor, seqlens_actual: torch.Tensor
 ) -> torch.Tensor:
     """Compute per-sequence, per-head FP32 mean of K over valid tokens only.
     k: (TotalPaddedTokens, Hk, D) bf16 CUDA -> KM: (B, Hk, D) fp32 contiguous.
-    Parallel per-64-row partials plus a serial fold in the original chunk order
-    (bitwise the previous per-(seq, head) serial loop)."""
+    Short sequences (avg padded length <= 512): one serial launch.
+    Longer: parallel per-64-row partials plus a serial fold in the original
+    chunk order (bitwise the serial kernel)."""
     if k.dim() != 3:
         raise ValueError(f"delta_matching: packed K must be 3-D (T, Hk, D), got {k.dim()}-D")
     T, Hk, D = k.shape
@@ -238,6 +276,14 @@ def kmean_varlen(
     if B == 0 or Hk == 0 or T == 0:
         return km
     BD = 64 if D % 64 == 0 else D
+    avg = T // max(B, 1)
+    if avg <= 512:
+        _kmean_varlen_serial_kernel[(B * Hk, D // BD)](
+            k, cu_seqlens_padded, seqlens_actual, km,
+            Hk, k.stride(0), k.stride(1), k.stride(2),
+            D=D, BD=BD,
+        )
+        return km
     max_chunks = (T + 63) // 64
     kp = torch.empty((B * Hk, max_chunks, D), device=k.device, dtype=torch.float32)
     _kmean_varlen_partial_kernel[(B * Hk, max_chunks, D // BD)](
@@ -319,6 +365,79 @@ def _quant_varlen_kernel(
     if WANT_T8:
         t8_off = pid_h.to(tl.int64) * T * D + rd.to(tl.int64)[:, None] * T + rm[None, :]
         tl.store(X8T + t8_off, tl.trans(q8))
+
+
+@triton.jit
+def _quant_kv_varlen_kernel(
+    K,        # (T, Hk, D) bf16 with strides (skn, skh, skd)
+    V,        # (T, Hk, D) bf16 with strides (svn, svh, svd)
+    KM,       # (B, Hk, D) fp32 contiguous
+    CU,       # int32 [B + 1]
+    ACTUAL,   # int32 [B]
+    K8,       # (Hk, T, D) e4m3 contiguous
+    K8S,      # (Hk, T // BLK) fp32 contiguous
+    K8T,      # (Hk, D, T) e4m3 contiguous (plain transpose)
+    V8,       # (Hk, T, D) e4m3 contiguous
+    V8S,      # (Hk, T // BLK) fp32 contiguous
+    T, B, H,
+    skn, skh, skd,
+    svn, svh, svd,
+    BLK: tl.constexpr,
+    D: tl.constexpr,
+):
+    """Fused K+V quantizer: same locate, K centered with pad forced to 0.0, V plain."""
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    tok0 = pid_m * BLK
+
+    lo = 0
+    hi = B
+    while lo + 1 < hi:
+        mid = (lo + hi) >> 1
+        if tl.load(CU + mid) <= tok0:
+            lo = mid
+        else:
+            hi = mid
+    b = lo
+    seq_start = tl.load(CU + b)
+    seq_actual = tl.load(ACTUAL + b)
+
+    rm = tok0 + tl.arange(0, BLK)
+    rd = tl.arange(0, D)
+    valid = (rm - seq_start) < seq_actual
+    km = tl.load(KM + (b.to(tl.int64) * H + pid_h) * D + rd)
+    base = pid_h.to(tl.int64) * T * D + rm.to(tl.int64)[:, None] * D + rd[None, :]
+
+    kin = (
+        rm.to(tl.int64)[:, None] * skn
+        + pid_h.to(tl.int64) * skh
+        + rd.to(tl.int64)[None, :] * skd
+    )
+    x = tl.load(K + kin, mask=valid[:, None], other=0.0).to(tl.float32)
+    x = tl.where(valid[:, None], x - km[None, :], 0.0)
+    amax = tl.max(tl.abs(x))
+    s = tl.maximum(amax, 1e-30) / E4M3_MAX
+    tl.store(K8S + pid_h.to(tl.int64) * (T // BLK) + pid_m, s)
+    q = tl.math.div_rn(x, tl.full([1, 1], 1.0, tl.float32) * s)
+    q = tl.minimum(tl.maximum(q, -E4M3_MAX), E4M3_MAX)
+    q8 = q.to(tl.float8e4nv)
+    tl.store(K8 + base, q8)
+    t8_off = pid_h.to(tl.int64) * T * D + rd.to(tl.int64)[:, None] * T + rm[None, :]
+    tl.store(K8T + t8_off, tl.trans(q8))
+
+    vin = (
+        rm.to(tl.int64)[:, None] * svn
+        + pid_h.to(tl.int64) * svh
+        + rd.to(tl.int64)[None, :] * svd
+    )
+    x = tl.load(V + vin, mask=valid[:, None], other=0.0).to(tl.float32)
+    amax = tl.max(tl.abs(x))
+    s = tl.maximum(amax, 1e-30) / E4M3_MAX
+    tl.store(V8S + pid_h.to(tl.int64) * (T // BLK) + pid_m, s)
+    q = tl.math.div_rn(x, tl.full([1, 1], 1.0, tl.float32) * s)
+    q = tl.minimum(tl.maximum(q, -E4M3_MAX), E4M3_MAX)
+    q8 = q.to(tl.float8e4nv)
+    tl.store(V8 + base, q8)
 
 
 @triton.jit
@@ -474,17 +593,11 @@ def quant_kv_varlen(
         return K8, K8s, kTt, V8, V8s
 
     km = kmean_varlen(k, cu, actual)
-    sm = D ** -0.5
-    _quant_varlen_kernel[(T // bk, Hk)](
-        k, km, cu, actual, K8, K8s, kTt, T, B, Hk,
+    _quant_kv_varlen_kernel[(T // bk, Hk)](
+        k, v, km, cu, actual, K8, K8s, kTt, V8, V8s, T, B, Hk,
         k.stride(0), k.stride(1), k.stride(2),
-        SM=sm, BLK=bk, D=D, MODE=1, WANT_T8=True,
-        num_warps=8,
-    )
-    _quant_varlen_kernel[(T // bk, Hk)](
-        v, km, cu, actual, V8, V8s, V8, T, B, Hk,
         v.stride(0), v.stride(1), v.stride(2),
-        SM=sm, BLK=bk, D=D, MODE=2, WANT_T8=False,
+        BLK=bk, D=D,
         num_warps=8,
     )
     return K8, K8s, kTt, V8, V8s

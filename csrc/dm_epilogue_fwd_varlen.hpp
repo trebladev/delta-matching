@@ -10,7 +10,7 @@
  *     first 192-row tile overruns by 64) falls back to predicated vectorized
  *     store so sequence b+1 is never overwritten.
  * Pad rows [seqlens_actual[b], padded_len[b]) are zeroed in registers before
- * storing so O stays strictly 0.0 in every pad slot.
+ * storing, and LSE pad slots are written 0.0f, so O/LSE do not need a host memset.
  ******************************************************************************/
 #pragma once
 
@@ -27,6 +27,38 @@
 namespace flash {
 
 using namespace cute;
+
+// Zero O/LSE pad rows [actual, padded) per sequence so varlen fwd can allocate
+// empty buffers. D=128 kBlockM=192 tiles do not cover every ALIGN=128 pad slot.
+static __global__ void dm_zero_varlen_pad_olse_kernel(
+    cutlass::bfloat16_t* __restrict__ o,
+    float* __restrict__ lse,
+    int const* __restrict__ cu,
+    int const* __restrict__ actual,
+    int H, int D, int T,
+    int64_t o_row_stride, int64_t o_head_stride)
+{
+    int const b = int(blockIdx.x);
+    int const start = cu[b];
+    int const n = actual[b];
+    int const npad = cu[b + 1] - start - n;
+    if (npad <= 0) { return; }
+    int const t0 = start + n;
+    int64_t const n_o = int64_t(npad) * H * D;
+    for (int64_t i = int64_t(threadIdx.x); i < n_o; i += int64_t(blockDim.x)) {
+        int const d = int(i % D);
+        int64_t const tmp = i / D;
+        int const h = int(tmp % H);
+        int const t = t0 + int(tmp / H);
+        o[int64_t(t) * o_row_stride + int64_t(h) * o_head_stride + d] = cutlass::bfloat16_t(0);
+    }
+    int64_t const n_lse = int64_t(npad) * H;
+    for (int64_t i = int64_t(threadIdx.x); i < n_lse; i += int64_t(blockDim.x)) {
+        int const t = t0 + int(i % npad);
+        int const h = int(i / npad);
+        lse[int64_t(h) * T + t] = 0.0f;
+    }
+}
 
 template <
     class TileShape_MNK_PV_,
@@ -194,15 +226,20 @@ struct CollectiveEpilogueFwdVarlen {
         auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(thread_idx);
         cute::copy(smem_tiled_copy_O, smem_thr_copy_O.retile_S(tOrO_out), smem_thr_copy_O.partition_D(sO));
 
-        // Write LSE for valid rows only (pad rows remain 0.0f from zero-init).
+        // Write LSE for valid rows; pad rows [seqlen_o, padded_len) are 0.0f so O/LSE
+        // do not depend on a host memset of the output buffers.
         Tensor mLSE = make_tensor(
             make_gmem_ptr(params.ptr_LSE + int64_t(offset_o) * get<0>(params.stride_LSE)),
             params.shape_LSE, params.stride_LSE)(_, bidh, _0{}, _0{});
         #pragma unroll
         for (int mi = 0; mi < size(lse); ++mi) {
             int const row = m_block * kBlockM + get<0>(taccOcO_row(mi));
-            if (get<1>(taccOcO_row(_0{})) == 0 && row < seqlen_o) {
-                mLSE(row) = lse(mi);
+            if (get<1>(taccOcO_row(_0{})) == 0) {
+                if (row < seqlen_o) {
+                    mLSE(row) = lse(mi);
+                } else if (row < padded_len) {
+                    mLSE(row) = 0.0f;
+                }
             }
         }
 
@@ -247,8 +284,10 @@ struct CollectiveEpilogueFwdVarlen {
                 tOpO(k) = get<1>(tOcO(_0{}, _0{}, k)) < get<1>(params.shape_O);
             }
             Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
+            // Pad rows are already 0 in tOrO_g; write through padded_len so O pad
+            // slots are defined without a host memset (must not cross into seq b+1).
             flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-                gmem_tiled_copy_O, tOrO_g, tOgO, tOcO, tOpO, seqlen_o - m_block * kBlockM);
+                gmem_tiled_copy_O, tOrO_g, tOgO, tOcO, tOpO, padded_len - m_block * kBlockM);
         }
     }
 
@@ -260,6 +299,7 @@ struct CollectiveEpilogueFwdVarlen {
                cute::tuple<int32_t, int32_t, int32_t, int32_t> const& block_coord) {
         auto [m_block, bidh, bidb, split_idx] = block_coord;
         int const offset_o = params.cu_seqlens[bidb];
+        int const padded_len = params.cu_seqlens[bidb + 1] - offset_o;
         int const seqlen_o = params.seqused[bidb];
         Tensor mLSE = make_tensor(
             make_gmem_ptr(params.ptr_LSE + int64_t(offset_o) * get<0>(params.stride_LSE)),
@@ -267,8 +307,25 @@ struct CollectiveEpilogueFwdVarlen {
         if (thread_idx < kBlockM) {
             int const row = m_block * kBlockM + thread_idx;
             if (row < seqlen_o) { mLSE(row) = -INFINITY; }
+            else if (row < padded_len) { mLSE(row) = 0.0f; }
         }
-        // O is zero-initialized on the host for varlen, so pad and empty tiles are already 0.0.
+        Tensor mO = make_tensor(
+            make_gmem_ptr(params.ptr_O + int64_t(offset_o) * get<0>(params.stride_O)),
+            params.shape_O, params.stride_O)(_, _, bidh, _0{}, _0{});
+        Tensor gO = local_tile(mO, select<0, 1>(TileShape_MNK_PV{}), make_coord(m_block, _0{}));
+        GmemTiledCopyO gmem_tiled_copy_O;
+        auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(thread_idx);
+        Tensor tOcO = gmem_thr_copy_O.partition_D(cute::make_identity_tensor(select<0, 1>(TileShape_MNK_PV{})));
+        Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOcO)));
+        #pragma unroll
+        for (int k = 0; k < size(tOpO); ++k) {
+            tOpO(k) = get<1>(tOcO(_0{}, _0{}, k)) < get<1>(params.shape_O);
+        }
+        Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
+        Tensor tOrO = make_fragment_like(tOgO);
+        cute::clear(tOrO);
+        flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+            gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, padded_len - m_block * kBlockM);
     }
 };
 
